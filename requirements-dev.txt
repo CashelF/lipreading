@@ -1,0 +1,5 @@
+-r requirements.txt
+pytest>=8,<10
+httpx>=0.28,<1
+opencv-python-headless==4.10.0.84
+scikit-image==0.24.0
