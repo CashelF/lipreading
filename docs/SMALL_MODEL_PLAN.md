@@ -34,7 +34,7 @@ See [Is this machine enough?](#is-this-machine-enough) for run lengths and renta
 
 For the pilot and all data preparation, yes. For the full-size model, no.
 
-- **Real training speed is not yet known.** Encoder-only synthetic batches ran at 670 video-hours per GPU-hour. The first real batches ran at about 150 while another job held the same GPU at 95%. Expect 300–600 alone. Read the true figure from `video_hours_per_hour` in `data/train/runs/pilot/train.jsonl`.
+- **Measured training speed:** about 1,150 video-hours per GPU-hour with the GPU to itself, on the pilot's first pass (clips of 4 seconds or less; later passes use longer clips and may be slower). It fell to about 150 while another job held the same GPU at 95%. The live figure is `video_hours_per_hour` in `data/train/runs/pilot/train.jsonl`. The run lengths below assume 300–600 and are therefore conservative.
 - **Pilot** (2,500 hours × 20 passes = 50,000 video-hours): 3.5–7 days on this GPU alone, about two weeks if the GPU stays shared.
 - **One full-size run** (10,000 hours × about 30 passes, plus a Whisper-feature pretraining stage of similar size, about 600,000 video-hours): 1,000–2,000 GPU-hours. That is 1.5–3 months on this machine, or about a week on 8 rented GPUs of the same class at roughly $2.5–5k.
 - **Whole programme** (three full-size runs and smaller ablations): 4,000–6,000 GPU-hours, about $9–15k rented at $2.50 per GPU-hour. The earlier $3–6k figure left out the pretraining stage and assumed the synthetic speed.

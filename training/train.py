@@ -77,11 +77,17 @@ def main():
     parser.add_argument('--dim', type=int, default=256)
     parser.add_argument('--layers', type=int, default=12)
     parser.add_argument('--dev-clips', type=int, default=1500)
+    parser.add_argument('--memory-gib', type=float, help='Cap on GPU memory, so other jobs on the card keep theirs.')
     parser.add_argument('--stop-after-steps', type=int, help='For smoke tests.')
     args = parser.parse_args()
 
     device = torch.device('cuda')
-    torch.backends.cudnn.benchmark = True
+    # Batch shapes change every step. Autotuning each new shape costs time and
+    # makes cuDNN hold large workspaces, so leave it off.
+    torch.backends.cudnn.benchmark = False
+    if args.memory_gib:
+        total = torch.cuda.get_device_properties(0).total_memory
+        torch.cuda.set_per_process_memory_fraction(min(1.0, args.memory_gib * 2 ** 30 / total), 0)
     args.output.mkdir(parents=True, exist_ok=True)
     vocabulary = Vocabulary(args.vocabulary)
     model = LipReader(vocabulary.size, width=args.width, dim=args.dim, layers=args.layers).to(device)
@@ -89,13 +95,13 @@ def main():
     plain = [p for p in model.parameters() if p.ndim <= 1]
     optimizer = torch.optim.AdamW([{'params': decay, 'weight_decay': args.weight_decay},
                                    {'params': plain, 'weight_decay': 0.0}], lr=args.lr, betas=(0.9, 0.98))
-    state = {'step': 0, 'epoch': 0, 'hours_seen': 0.0, 'best_wer': None, 'restarts': 0}
+    state = {'step': 0, 'epoch': 0, 'hours_seen': 0.0, 'best_wer': None, 'restarts': 0, 'skipped': 0}
     last = args.output / 'last.pt'
     if last.exists():
         checkpoint = torch.load(last, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint['model'])
         optimizer.load_state_dict(checkpoint['optimizer'])
-        state = checkpoint['state']
+        state.update(checkpoint['state'])
         state['restarts'] += 1
     total_hours = args.hours * args.epochs
     warmup_hours = total_hours * args.warmup
@@ -145,15 +151,23 @@ def main():
             lr = learning_rate(state['hours_seen'], total_hours, warmup_hours, args.lr)
             for group in optimizer.param_groups:
                 group['lr'] = lr
-            video = video.to(device, non_blocking=True)
-            x = prepare(video, frames, train=True)
-            with torch.autocast('cuda', torch.bfloat16):
-                loss, ctc, attention = model(x, frames.to(device), tokens.to(device), token_counts.to(device))
-            optimizer.zero_grad(set_to_none=True)
-            if torch.isfinite(loss):
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-                optimizer.step()
+            try:
+                video = video.to(device, non_blocking=True)
+                x = prepare(video, frames, train=True)
+                with torch.autocast('cuda', torch.bfloat16):
+                    loss, ctc, attention = model(x, frames.to(device), tokens.to(device), token_counts.to(device))
+                optimizer.zero_grad(set_to_none=True)
+                if torch.isfinite(loss):
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+                    optimizer.step()
+            except torch.OutOfMemoryError:
+                # A rare oversized batch under the memory cap: drop it and carry on.
+                del video
+                optimizer.zero_grad(set_to_none=True)
+                torch.cuda.empty_cache()
+                state['skipped'] += 1
+                continue
             state['step'] += 1
             clip_frames = int(frames.sum())
             state['hours_seen'] += clip_frames / 25 / 3600
@@ -165,6 +179,7 @@ def main():
                 log({'step': state['step'], 'epoch': epoch, 'hours_seen': round(state['hours_seen'], 1),
                      'loss': round(sum(columns[0]) / len(window), 4), 'ctc': round(sum(columns[1]) / len(window), 2),
                      'attention': round(sum(columns[2]) / len(window), 4), 'lr': round(lr, 7),
+                     'skipped': state['skipped'], 'gpu_gib': round(torch.cuda.max_memory_reserved() / 2 ** 30, 1),
                      'video_hours_per_hour': round(window_frames / 25 / elapsed)})
                 window_start, window_frames, window = time.perf_counter(), 0, []
             if state['step'] % 2000 == 0:
