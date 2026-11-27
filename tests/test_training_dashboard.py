@@ -11,7 +11,7 @@ def write_log(folder, rows, tail=''):
 
 def step(hours, ctc=5.9):
     return {'step': int(hours * 10), 'epoch': 0, 'hours_seen': hours, 'loss': 5.0, 'ctc': ctc, 'attention': 4.5,
-            'lr': 2e-4, 'skipped': 0, 'gpu_gib': 27.0, 'video_hours_per_hour': 600}
+            'teacher': 1.2, 'lr': 2e-4, 'gpu_gib': 4.0, 'video_hours_per_hour': 3000}
 
 
 def test_load_reads_curves_and_drops_hours_logged_twice(tmp_path):
@@ -21,7 +21,7 @@ def test_load_reads_curves_and_drops_hours_logged_twice(tmp_path):
         {'event': 'start', 'hours_seen': 20.0, 'total_hours': 2000.0, 'time': 900}, step(30, ctc=5.5),
         {'event': 'epoch', 'epoch': 0, 'step': 300, 'hours_seen': 30.0, 'dev_loss': 4.9, 'dev_wer': 0.97, 'dev_clips': 600},
     ], tail='{"step": 40')  # A line still being written.
-    write_log(tmp_path / 'done', [{**step(5), 'audio': 0.38}, {'event': 'finished', 'step': 50}])
+    write_log(tmp_path / 'done', [step(5), {'event': 'finished', 'step': 50}])
     (tmp_path / 'empty').mkdir()
     write_log(tmp_path / 'zz-older', [{'event': 'start', 'hours_seen': 0.0, 'time': 100}, step(1)])
     listed = load(tmp_path)['runs']
@@ -29,7 +29,7 @@ def test_load_reads_curves_and_drops_hours_logged_twice(tmp_path):
     assert [run['name'] for run in listed] == ['done', 'zz-older', 'pilot']
     runs = {run['name']: run for run in listed}
     assert [row[:2] for row in runs['pilot']['steps']] == [[10, 5.9], [20, 5.9], [30, 5.5]]
-    assert runs['pilot']['steps'][0][5] is None and runs['done']['steps'][0][5] == 0.38
+    assert runs['pilot']['steps'][0][5] == 1.2
     assert runs['pilot']['passes'] == [[1, 30.0, 0.97, 4.9]]
     assert runs['pilot']['status'] == 'training' and runs['pilot']['total_hours'] == 2000.0
     assert runs['done']['status'] == 'finished' and runs['done']['total_hours'] is None

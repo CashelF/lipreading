@@ -17,23 +17,27 @@ def frame_count(data: bytes) -> int:
 _FULL_RANGE = np.clip(np.round((np.arange(256) - 16) * 255 / 219), 0, 255).astype(np.uint8)
 
 
+# Planar 8-bit formats whose first plane is the full-size luma; only the colour planes differ.
+_LUMA_FIRST = {'yuv420p', 'yuv422p', 'yuv444p', 'yuvj420p', 'yuvj422p', 'yuvj444p'}
+
+
 def decode_gray(data: bytes) -> np.ndarray:
     """Return full-range uint8 frames shaped (T, H, W).
 
-    Reads the luma plane directly instead of converting each frame, which
-    roughly doubles decoding speed. Clips are stored in video range.
+    Reads the luma plane directly instead of converting each frame. Converting is 20 times
+    slower, and the upstream VoxCeleb2 clips (4:4:4 colour) would all take that path.
+    Clips are stored in video range.
     """
     planes = []
     with av.open(io.BytesIO(data)) as container:
         stream = container.streams.video[0]
         stream.thread_type = 'NONE'  # Frames are tiny; threads only add overhead.
         for frame in container.decode(stream):
-            if frame.format.name not in ('yuv420p', 'yuvj420p'):
+            if frame.format.name not in _LUMA_FIRST:
                 frame = frame.reformat(format='yuv420p')
             plane = frame.planes[0]
-            luma = np.frombuffer(plane, np.uint8).reshape(frame.height, plane.line_size)[:, :frame.width]
-            planes.append(luma if frame.format.name == 'yuvj420p' else luma.copy())
-            full_range = frame.format.name == 'yuvj420p'
+            planes.append(np.frombuffer(plane, np.uint8).reshape(frame.height, plane.line_size)[:, :frame.width].copy())
+            full_range = frame.format.name.startswith('yuvj')
     if not planes:
         raise ValueError('Clip has no video frames.')
     stacked = np.stack(planes)
@@ -57,17 +61,6 @@ def encode_gray(frames: np.ndarray, fps: int = 25, crf: int = 20) -> bytes:
         for packet in stream.encode():
             container.mux(packet)
     return output.getvalue()
-
-
-def decode_audio(data: bytes) -> np.ndarray:
-    """A clip's soundtrack as mono 16 kHz int16 samples. ``data`` is an audio file or a video file that holds one."""
-    chunks = []
-    with av.open(io.BytesIO(data)) as container:
-        resampler = av.AudioResampler(format='s16', layout='mono', rate=16000)
-        for frame in container.decode(audio=0):
-            chunks += [resampled.to_ndarray()[0] for resampled in resampler.resample(frame)]
-        chunks += [resampled.to_ndarray()[0] for resampled in resampler.resample(None)]
-    return np.concatenate(chunks)
 
 
 def transcode_audio(data: bytes, bitrate: int = 16000) -> bytes | None:

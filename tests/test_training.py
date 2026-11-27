@@ -1,8 +1,10 @@
-"""Pilot lipreader training: shards, clip coding, batching and the model's losses.
+"""Lipreader training: shards, clip coding, stored features, batching and the model's losses.
 
-Runs in the training environment (.venv-train); skipped where its packages are absent.
+Runs in the model environment (.venv-model); skipped where its packages are absent.
 """
+import json
 import math
+from pathlib import Path
 
 import pytest
 
@@ -13,13 +15,12 @@ pytest.importorskip('torchaudio')
 pytest.importorskip('av')
 pytest.importorskip('sentencepiece')
 
-from training.data import ClipBatches, prepare
-from training.model import LipReader
+from training.data import SCALE, ClipBatches, FeatureBatches, prepare, quantize, restore, time_mask
+from training.model import Frontend, LipReader
 from training.shards import ShardWriter, read_samples
-from training.teacher import CODES, WhisperCodes
 from training.text import Vocabulary, clean, train_vocabulary
 from training.train import learning_rate
-from training.video import decode_audio, decode_gray, encode_gray, frame_count, transcode_audio
+from training.video import decode_gray, encode_gray, frame_count
 
 # Torch 2.9.1's CPU CTC loss crashes with several OpenMP threads on this machine.
 # Training and evaluation compute it on the GPU, where it is unaffected.
@@ -27,6 +28,7 @@ torch.set_num_threads(1)
 
 SENTENCES = ['the quick brown fox jumps over the lazy dog', 'please pass the salt and the pepper',
              'we are leaving early in the morning', 'i left my keys on the kitchen table'] * 30
+TINY = dict(dim=32, layers=1, heads=2, decoder_layers=1)
 
 
 def clip(frames=50, seed=0):
@@ -50,6 +52,20 @@ def write_shard(path, clips):
     return path
 
 
+def write_features(folder, clips, seed=0):
+    """A folder as extract_features.py writes it. Each clip's features are its number, so batches can be checked."""
+    folder.mkdir(parents=True)
+    generator = torch.Generator().manual_seed(seed)
+    front, teacher = [], []
+    for number, (frames, _) in enumerate(clips):
+        front.append(np.full((frames, 768), number, np.int8))
+        teacher.append(quantize(torch.randn(frames, 768, generator=generator)))
+    np.save(folder / 'front.npy', np.concatenate(front))
+    np.save(folder / 'teacher.npy', np.concatenate(teacher))
+    (folder / 'index.json').write_text(json.dumps({'scale': SCALE, 'clips': [[f'clip{n}', text, frames] for n, (frames, text) in enumerate(clips)]}))
+    return folder
+
+
 def test_recoding_keeps_brightness_and_frame_count():
     original = clip(40)
     encoded = encode_gray(original)
@@ -61,12 +77,37 @@ def test_recoding_keeps_brightness_and_frame_count():
     assert abs(float(decoded.mean()) - float(original.mean())) < 1.5
 
 
+def test_colour_clips_decode_to_the_same_gray_without_conversion():
+    import io
+    import av
+    gray = clip(12)
+    output = io.BytesIO()
+    with av.open(output, 'w', format='mp4') as container:  # As the upstream VoxCeleb2 clips: 4:4:4 colour.
+        stream = container.add_stream('libx264', rate=25)
+        stream.width = stream.height = 96
+        stream.pix_fmt = 'yuv444p'
+        stream.options = {'crf': '10'}
+        for image in gray:
+            frame = av.VideoFrame.from_ndarray(np.stack([image] * 3, -1), format='rgb24').reformat(format='yuv444p')
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+    decoded = decode_gray(output.getvalue())
+    with av.open(io.BytesIO(output.getvalue())) as container:
+        assert next(container.decode(video=0)).format.name == 'yuv444p'
+        container.seek(0)
+        converted = np.stack([frame.to_ndarray(format='gray') for frame in container.decode(video=0)])
+    assert decoded.shape == gray.shape and np.abs(decoded.astype(int) - gray.astype(int)).mean() < 3
+    assert np.abs(decoded.astype(int) - converted.astype(int)).max() <= 1  # The slow, converting route agrees.
+
+
 def test_shard_round_trip_is_atomic_and_reads_both_layouts(tmp_path):
     writer = ShardWriter(tmp_path / 'a.tar')
     writer.add('one', b'video-bytes', 'HELLO THERE', audio=b'sound')
     assert not (tmp_path / 'a.tar').exists()
     writer.close()
-    assert list(read_samples(tmp_path / 'a.tar')) == [{'key': 'one', 'video': b'video-bytes', 'text': 'HELLO THERE', 'audio': b'sound'}]
+    assert list(read_samples(tmp_path / 'a.tar')) == [{'key': 'one', 'video': b'video-bytes', 'text': 'HELLO THERE'}]
     import io, tarfile
     with tarfile.open(tmp_path / 'upstream.tar', 'w') as tar:
         for name, data in (('x.label', b'UPSTREAM TEXT'), ('x.length', b'3'), ('x.video', b'vv'), ('y.video', b'no label')):
@@ -87,12 +128,14 @@ def test_vocabulary_reserves_blank_and_sentence_marker(vocabulary):
     assert words.decode(ids + [words.sos_eos, 0]) == 'please pass the salt'
 
 
-def test_batches_respect_frame_budget_and_drop_unusable_clips(tmp_path, vocabulary):
-    shard = write_shard(tmp_path / 's.tar', [(90, SENTENCES[0]), (96, SENTENCES[1]), (100, SENTENCES[2]),
-                                             (5, SENTENCES[3]),                # shorter than min_frames
-                                             (150, SENTENCES[0]),              # longer than max_frames
-                                             (14, ' '.join(SENTENCES[:3])),    # more tokens than frames allow
-                                             (40, '123 456')])                 # nothing left after cleaning
+UNUSABLE = [(5, SENTENCES[3]),                # shorter than min_frames
+            (150, SENTENCES[0]),              # longer than max_frames
+            (14, ' '.join(SENTENCES[:3])),    # more tokens than frames allow
+            (40, '123 456')]                  # nothing left after cleaning
+
+
+def test_clip_batches_respect_frame_budget_and_drop_unusable_clips(tmp_path, vocabulary):
+    shard = write_shard(tmp_path / 's.tar', [(90, SENTENCES[0]), (96, SENTENCES[1]), (100, SENTENCES[2])] + UNUSABLE)
     batches = list(ClipBatches([shard], vocabulary, frames_per_batch=200, max_frames=100, shuffle=False, with_text=True))
     assert sorted(int(n) for batch in batches for n in batch[1]) == [90, 96, 100]
     for video, frames, tokens, token_counts, texts in batches:
@@ -101,145 +144,158 @@ def test_batches_respect_frame_budget_and_drop_unusable_clips(tmp_path, vocabula
         assert tokens.shape == (len(texts), int(token_counts.max()))
 
 
-def tone(seconds=2.0, start=0.5):
-    """A WAV file: silence, then a 440 Hz tone from ``start`` seconds on."""
-    import io, wave
-    time = np.arange(int(16000 * seconds)) / 16000
-    samples = (np.sin(2 * np.pi * 440 * time) * 12000 * (time >= start)).astype(np.int16)
-    output = io.BytesIO()
-    with wave.open(output, 'wb') as file:
-        file.setnchannels(1), file.setsampwidth(2), file.setframerate(16000)
-        file.writeframes(samples.tobytes())
-    return output.getvalue(), samples
-
-
-def test_stored_audio_stays_in_step_with_the_video(tmp_path, vocabulary):
-    wav, samples = tone()
-    stored = transcode_audio(wav)
-    decoded = decode_audio(stored)
-    assert abs(len(decoded) - len(samples)) <= 640
-    # The tone must start within one video frame (640 samples) of where it started before storage.
-    onset = lambda signal: int(np.argmax(np.abs(signal.astype(int)) > 3000))
-    assert abs(onset(decoded) - onset(samples)) < 640
-    writer = ShardWriter(tmp_path / 'sound.tar')
-    writer.add('with', encode_gray(clip(100)), SENTENCES[0], audio=stored)  # Twice as long as its sound.
-    writer.add('without', encode_gray(clip(100, 1)), SENTENCES[1])
-    writer.close()
-    batches = list(ClipBatches([tmp_path / 'sound.tar'], vocabulary, frames_per_batch=200, max_frames=100, shuffle=False,
-                               with_audio=True))
-    assert len(batches) == 1  # The clip with no soundtrack has nothing to predict.
-    video, frames, _, _, audio = batches[0]
-    assert audio.dtype == torch.int16 and audio.shape == (1, 100 * 640) and int(frames[0]) == 100
-    # The tone starts in video frame 12 (0.48 to 0.52 s) and ends with the sound at frame 50.
-    loudness = audio[0].float().abs().view(100, 640).mean(1)
-    assert loudness[:12].max() < 100 < loudness[13:49].min() and loudness[51:].max() < 100
-
-
-@pytest.fixture(scope='module')
-def teacher():
-    transformers = pytest.importorskip('transformers')
-    torch.manual_seed(4)
-    config = transformers.WhisperConfig(d_model=32, encoder_layers=1, encoder_attention_heads=2, encoder_ffn_dim=64,
-                                        decoder_layers=1, decoder_attention_heads=2, decoder_ffn_dim=64)
-    return WhisperCodes(transformers.WhisperModel(config).encoder, transformers.WhisperFeatureExtractor().mel_filters)
-
-
-def test_teacher_gives_two_codes_per_video_frame(teacher):
-    generator = torch.Generator().manual_seed(5)
-    audio = (torch.randn(3, 40 * 640, generator=generator) * 3000).to(torch.int16)
-    frames = torch.tensor([40, 40, 25])
-    teacher.fit([(audio, frames)])
-    codes = teacher(audio)
-    assert codes.shape == (3, 40, 2) and codes.dtype == torch.long and 0 <= codes.min() and codes.max() < CODES
-    # The codes must spread out; a collapsed quantizer gives the same one or two everywhere.
-    assert codes.unique().numel() > 20
-    assert torch.equal(codes, teacher(audio))
-    # A run that is continued must keep its codes: they come from the saved state, not from a new fit.
-    transformers = pytest.importorskip('transformers')
-    other = WhisperCodes(teacher.encoder, transformers.WhisperFeatureExtractor().mel_filters, seed=1)
-    assert not torch.equal(other(audio), codes)
-    other.load_state_dict(teacher.code_state(), strict=False)
-    assert torch.equal(other(audio), codes)
-    assert not any(parameter.requires_grad for parameter in teacher.parameters())
-
-
-def test_audio_loss_counts_only_real_frames(vocabulary):
-    torch.manual_seed(3)
+def test_feature_batches_keep_each_clip_with_its_own_text_and_target(tmp_path, vocabulary):
+    clips = [(90, SENTENCES[0]), (96, SENTENCES[1]), (100, SENTENCES[2]), (93, SENTENCES[3])] + UNUSABLE
+    folder = write_features(tmp_path / 'shard', clips)
+    stored = np.load(folder / 'teacher.npy')
+    starts = np.cumsum([0] + [frames for frames, _ in clips])
     words = Vocabulary(vocabulary)
-    model = LipReader(words.size, width=8, dim=32, layers=1, heads=2, decoder_layers=1).eval()
-    video, frames = torch.randn(2, 30, 88, 88), torch.tensor([30, 20])
-    tokens, counts = torch.tensor([words.encode(SENTENCES[0])[:4]] * 2), torch.tensor([4, 4])
-    sound = torch.randint(0, CODES, (2, 30, 2))
-    without = model(video, frames, tokens, counts)
-    loss, _, _, audio = model(video, frames, tokens, counts, audio=sound, audio_weight=2.0)
-    assert audio > 0 and float(loss) == pytest.approx(float(without[0]) + 2 * float(audio), rel=1e-5)
-    changed = sound.clone()
-    changed[1, 20:] = (changed[1, 20:] + 1) % CODES  # Past the end of the second clip.
-    assert float(model(video, frames, tokens, counts, audio=changed)[3]) == pytest.approx(float(audio), rel=1e-5)
+    seen = set()
+    for shuffle in (False, True):
+        loader = FeatureBatches([folder], vocabulary, frames_per_batch=200, max_frames=100, shuffle=shuffle, with_text=True)
+        for front, frames, tokens, token_counts, teacher, texts in loader:
+            assert front.dtype == teacher.dtype == torch.int8 and front.shape == teacher.shape == (len(texts), int(frames.max()), 768)
+            assert front.shape[0] * front.shape[1] <= 200
+            for row, text in enumerate(texts):
+                number, count = int(front[row, 0, 0]), int(frames[row])  # The clip's number was stored as its features.
+                seen.add(number)
+                assert clips[number] == (count, text)
+                assert tokens[row, :token_counts[row]].tolist() == words.encode(text)
+                assert np.array_equal(teacher[row, :count].numpy(), stored[starts[number]:starts[number] + count])
+                assert not front[row, count:].any() and not teacher[row, count:].any()
+    assert seen == {0, 1, 2, 3}
 
 
-def test_prepare_crops_normalizes_and_zeroes_padding():
+def test_stored_features_survive_the_round_trip_to_int8():
+    features = torch.randn(7, 768) * 3 + 5
+    stored = quantize(features)
+    standardized = torch.nn.functional.layer_norm(features, (768,))
+    assert stored.dtype == np.int8 and float((restore(torch.from_numpy(stored)) - standardized).abs().max()) <= 0.5 / SCALE + 1e-6
+
+
+def test_prepare_takes_the_centre_and_zeroes_padding():
     video = torch.full((2, 6, 96, 96), 128, dtype=torch.uint8)
-    frames = torch.tensor([6, 3])
-    evaluated = prepare(video, frames, train=False)
-    assert evaluated.shape == (2, 6, 88, 88)
-    assert torch.allclose(evaluated[0], torch.full((6, 88, 88), (128 / 255 - 0.421) / 0.165))
-    assert evaluated[1, 3:].abs().sum() == 0
-    trained = prepare(video, frames, train=True)
-    assert trained.shape == evaluated.shape and trained[1, 3:].abs().sum() == 0
+    video[:, :, :4] = 0  # Outside the 88x88 centre.
+    prepared = prepare(video, torch.tensor([6, 3]))
+    assert prepared.shape == (2, 6, 88, 88)
+    assert torch.allclose(prepared[0], torch.full((6, 88, 88), (128 / 255 - 0.421) / 0.165))
+    assert prepared[1, 3:].abs().sum() == 0
+
+
+def test_time_mask_hides_whole_frames_inside_each_clip():
+    features = torch.ones(2, 100, 8)
+    frames = torch.tensor([100, 40])
+    masked = time_mask(features, frames)
+    hidden = masked.sum(-1) == 0
+    assert ((masked.sum(-1) == 8) | hidden).all()  # A frame is hidden whole or not at all.
+    assert not hidden[1, 40:].any()  # Never past a clip's end.
+    assert hidden[0].sum() <= 40 and hidden[1].sum() <= 10  # At most 10 frames per second of video.
+
+
+def test_front_end_matches_flare(tmp_path):
+    """Our front end must compute what FLARE's does, or its trained weights and stored features mean nothing."""
+    source = Path(__file__).resolve().parents[1] / 'vendor/FLARE/flare/convnext.py'
+    if not source.exists():
+        pytest.skip('FLARE source not installed (scripts/setup_model.py).')
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('flare_convnext', source)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    torch.manual_seed(5)
+    theirs, ours = module.ConvEncoderT().eval(), Frontend().eval()
+    ours.load_state_dict(theirs.state_dict())
+    video = torch.randn(2, 12, 88, 88)
+    with torch.no_grad():
+        assert torch.allclose(ours(video), theirs(video.unsqueeze(1)).transpose(1, 2), atol=1e-5)
+
+
+def tiny_batch(words):
+    ids = [words.encode(SENTENCES[0])[:8], words.encode(SENTENCES[1])[:5]]
+    tokens = torch.zeros(2, 8, dtype=torch.long)
+    for row, values in enumerate(ids):
+        tokens[row, :len(values)] = torch.tensor(values)
+    return torch.randn(2, 30, 768), torch.tensor([30, 20]), tokens, torch.tensor([len(v) for v in ids])
 
 
 def test_model_losses_and_decoders_on_a_tiny_network(vocabulary):
     torch.manual_seed(0)
     words = Vocabulary(vocabulary)
-    model = LipReader(words.size, width=8, dim=32, layers=1, heads=2, decoder_layers=1)
-    video = torch.randn(2, 30, 88, 88)
-    frames = torch.tensor([30, 20])
-    ids = [words.encode(SENTENCES[0])[:8], words.encode(SENTENCES[1])[:5]]
-    tokens = torch.zeros(2, 8, dtype=torch.long)
-    for row, values in enumerate(ids):
-        tokens[row, :len(values)] = torch.tensor(values)
-    loss, ctc, attention, sound = model(video, frames, tokens, torch.tensor([len(v) for v in ids]))
-    assert torch.isfinite(loss) and ctc > 0 and attention > 0 and sound == 0
+    model = LipReader(words.size, **TINY)
+    features, frames, tokens, counts = tiny_batch(words)
+    loss, ctc, attention, teacher = model(features, frames, tokens, counts)
+    assert torch.isfinite(loss) and ctc > 0 and attention > 0 and teacher == 0
     loss.backward()
     assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
+    assert all(p.grad is None for p in model.frontend.parameters())  # FLARE's front end is never trained.
     model.eval()
-    greedy = model.greedy(video, frames, max_tokens=6)
+    greedy = model.greedy(features, frames, max_tokens=6)
     assert len(greedy) == 2 and all(len(row) <= 6 and words.sos_eos not in row for row in greedy)
-    best = model.beam_search(video[0], frames[0], beam=3, max_tokens=6)
+    best = model.beam_search(features[0], frames[0], beam=3, max_tokens=6)
     assert len(best) <= 6 and all(0 <= token < words.sos_eos for token in best)
+    # On video, the front end gives the same kind of features training reads from disk.
+    seen = model.front(torch.randn(1, 9, 88, 88))
+    assert seen.shape == (1, 9, 768) and torch.allclose(seen.mean(-1), torch.zeros(1, 9), atol=1e-4)
 
 
 def test_losses_are_per_token_not_per_clip(vocabulary):
     torch.manual_seed(2)
     words = Vocabulary(vocabulary)
-    model = LipReader(words.size, width=8, dim=32, layers=1, heads=2, decoder_layers=1).eval()
-    video = torch.randn(2, 40, 88, 88)
+    model = LipReader(words.size, **TINY).eval()
+    features = torch.randn(2, 40, 768)
     frames = torch.tensor([40, 40])
     long, short = words.encode(SENTENCES[0])[:9], words.encode(SENTENCES[1])[:3]
     tokens = torch.zeros(2, 9, dtype=torch.long)
     tokens[0], tokens[1, :3] = torch.tensor(long), torch.tensor(short)
-    _, ctc, attention, _ = model(video, frames, tokens, torch.tensor([9, 3]))
-    alone = [model(video[row:row + 1], frames[row:row + 1], tokens[row:row + 1, :count], torch.tensor([count]))
-             for row, count in enumerate((9, 3))]
+    with torch.no_grad():
+        _, ctc, attention, _ = model(features, frames, tokens, torch.tensor([9, 3]))
+        alone = [model(features[row:row + 1], frames[row:row + 1], tokens[row:row + 1, :count], torch.tensor([count]))
+                 for row, count in enumerate((9, 3))]
     # A 9-token clip weighs three times a 3-token clip; the attention loss also counts each end marker.
     assert float(ctc) == pytest.approx((9 * float(alone[0][1]) + 3 * float(alone[1][1])) / 12, rel=1e-4)
     assert float(attention) == pytest.approx((10 * float(alone[0][2]) + 4 * float(alone[1][2])) / 14, rel=1e-4)
 
 
+def test_teacher_loss_counts_only_real_frames_and_is_zero_for_a_perfect_copy(vocabulary):
+    torch.manual_seed(3)
+    words = Vocabulary(vocabulary)
+    model = LipReader(words.size, **TINY).eval()
+    features, frames, tokens, counts = tiny_batch(words)
+    wanted = torch.randn(2, 30, 768)
+    with torch.no_grad():
+        without = model(features, frames, tokens, counts)
+        loss, _, _, teacher = model(features, frames, tokens, counts, teacher=wanted, teacher_weight=2.0)
+        assert teacher > 0 and float(loss) == pytest.approx(float(without[0]) + 2 * float(teacher), rel=1e-5)
+        changed = wanted.clone()
+        changed[1, 20:] += 100  # Past the end of the second clip.
+        assert float(model(features, frames, tokens, counts, teacher=changed)[3]) == pytest.approx(float(teacher), rel=1e-5)
+        states, _, _ = model.encode(features, frames)
+        assert float(model(features, frames, tokens, counts, teacher=model.teacher(states))[3]) == pytest.approx(0, abs=1e-5)
+
+
+def test_a_clip_is_encoded_the_same_alone_or_beside_a_longer_clip(vocabulary):
+    torch.manual_seed(6)
+    model = LipReader(Vocabulary(vocabulary).size, dim=32, layers=3, heads=2, decoder_layers=1).eval()
+    features, frames = torch.randn(2, 80, 768), torch.tensor([80, 30])
+    with torch.no_grad():
+        together, _, padding = model.encode(features, frames)
+        alone, _, _ = model.encode(features[1:, :30], frames[1:])
+    assert padding[1, 30:].all() and not padding[1, :30].any()
+    assert torch.allclose(together[1, :30], alone[0], atol=1e-5)
+
+
 def test_padding_does_not_change_a_clips_loss(vocabulary):
     torch.manual_seed(1)
     words = Vocabulary(vocabulary)
-    model = LipReader(words.size, width=8, dim=32, layers=1, heads=2, decoder_layers=1).eval()
-    video = torch.randn(1, 24, 88, 88)
+    model = LipReader(words.size, **TINY).eval()
+    features = torch.randn(1, 24, 768)
     tokens = torch.tensor([words.encode(SENTENCES[2])[:6]])
     count = torch.tensor([tokens.shape[1]])
-    alone = model(video, torch.tensor([24]), tokens, count)[0]
-    padded_video = torch.cat([video, torch.zeros(1, 12, 88, 88)], 1)
-    padded_tokens = torch.cat([tokens, torch.zeros(1, 3, dtype=torch.long)], 1)
-    padded = model(padded_video, torch.tensor([24]), padded_tokens, count)[0]
-    # The 5-frame stem sees zeros past the clip end either way; only tiny numeric drift is allowed.
-    assert abs(float(alone) - float(padded)) < 0.05 * float(alone)
+    with torch.no_grad():
+        alone = model(features, torch.tensor([24]), tokens, count)[0]
+        padded_features = torch.cat([features, torch.zeros(1, 12, 768)], 1)
+        padded_tokens = torch.cat([tokens, torch.zeros(1, 3, dtype=torch.long)], 1)
+        padded = model(padded_features, torch.tensor([24]), padded_tokens, count)[0]
+    assert float(alone) == pytest.approx(float(padded), rel=1e-4)
 
 
 def test_learning_rate_warms_up_then_decays_to_zero():

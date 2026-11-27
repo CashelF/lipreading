@@ -24,7 +24,7 @@ from training.text import Vocabulary
 def load(checkpoint_path: Path, device) -> LipReader:
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config = checkpoint['config']
-    model = LipReader(config['vocab_size'], width=config['width'], dim=config['dim'], layers=config['layers'])
+    model = LipReader(config['vocab_size'], dim=config['dim'], layers=config['layers'])
     model.load_state_dict(checkpoint['model'])
     return model.to(device).eval()
 
@@ -44,10 +44,11 @@ def main():
     dataset = ClipBatches(args.shards, args.vocabulary, frames_per_batch=6000, shuffle=False, with_text=True)
     rows = []
     for video, frames, _, _, texts in DataLoader(dataset, batch_size=None, num_workers=2):
-        x = prepare(video.to(device), frames.to(device), train=False)
+        with torch.autocast('cuda', torch.bfloat16):
+            features = model.front(prepare(video.to(device), frames))
         for index, text in enumerate(texts):
             with torch.autocast('cuda', torch.bfloat16):
-                ids = model.beam_search(x[index, :frames[index]], frames[index].to(device), beam=args.beam)
+                ids = model.beam_search(features[index, :frames[index]], frames[index].to(device), beam=args.beam)
             rows.append(score(text, vocabulary.decode(ids)))
         if len(rows) >= args.limit:
             break

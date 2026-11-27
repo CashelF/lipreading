@@ -1,30 +1,34 @@
 # Plan: a phone-sized lipreader
 
-Status: **proposal; costs measured and data surveyed 2026-11-26.** Nothing here is in the live app.
+Status: **pilot training; approach changed 2026-11-27 from training from scratch to distilling FLARE.** Nothing here is in the live app.
 
 Goal: run lipreading in a phone browser in real time, with word accuracy equal to FLARE-LLM Large or slightly worse, measured on held-out video (see Phases).
 
 ## Approach
 
-Train a small streaming model from scratch. Don't scale FLARE up or post-train it.
+Distill FLARE's visual encoder into a small model ([TRAINING.md](TRAINING.md#how-it-learns)). Keep FLARE's 14M-parameter lip front end as it is, train a small Conformer to reproduce FLARE's encoder output frame by frame, and train a small text decoder on the transcripts at the same time. Don't scale FLARE up, and don't train from scratch.
 
-- About 95% of FLARE's parameters are its 7B Qwen decoder, which mostly supplies language knowledge. In the FLARE paper the same 342M visual model scores 15.9% LRS3 WER with a small 58M decoder and 13.2% with Qwen, so the LLM is worth under 3 points. See [Is 10k hours enough?](#is-10k-hours-enough) for the published data-scaling results.
-- **Labels come from audio.** Whisper transcribes each training video's soundtrack, and the lipreader learns from the silent frames only. At run time the app still never uses audio.
-- **FLARE can't label at scale.** It took 2.9 s of GPU time to decode a 4 s clip (beam 30), so labelling 10k hours would take about 7,200 GPU-hours. FLARE's visual-encoder features are a cheaper optional teacher, because they need no language-model decoding.
+- **From scratch was tried first and did not start.** Three runs on 2026-11-27 (text only; a long short-clip stage; audio targets) never got dev WER under 100% in up to 2,800 video-hours. FLARE's own encoder took 800,000 pretraining steps to learn to tell mouth shapes apart.
+- **FLARE is a strong teacher on this data.** Lip stream only, it scored 31% WER on held-out VoxCeleb2 speakers and 10% on clips from its own training set (60 clips each, beam 5). The student sees the same video, so everything in the teacher's features is visible to it.
+- **The LLM is left out.** About 95% of FLARE's parameters are its 7B Qwen decoder, which mostly supplies language knowledge. In the FLARE paper the same 342M visual model scores 15.9% LRS3 WER with a small 58M decoder and 13.2% with Qwen, so the LLM is worth under 3 points.
+- **Labels come from audio**, already made for the pilot's data. For new video, Whisper transcribes the soundtrack. At run time the app still never uses audio.
+- **FLARE can't label at scale.** It took 2.9 s of GPU time to decode a 4 s clip (beam 30), so labelling 10k hours with it would take about 7,200 GPU-hours. Its encoder features need no language-model decoding and cost about 1 GPU-hour per 1,000 hours of video.
 
-Pipeline: video → MediaPipe face landmarks (the same tracker the phone would run) → 88×88 grayscale lip and face crops → Whisper labels → training → int8 export → WebGPU in the browser.
+Pipeline: video → mouth crops as FLARE's lip stream expects them (96×96, aligned as in `backend/preprocessing.py`) → Whisper labels → FLARE features, once → training from features → int8 export → WebGPU in the browser.
 
 ## Measured costs on this machine
 
-All throughput numbers below come from this machine: an RTX PRO 6000 Blackwell (96 GB) and a 32-core Threadripper 9970X. Training used synthetic tensors, so the numbers show compute only, not accuracy.
+All throughput numbers below come from this machine: an RTX PRO 6000 Blackwell (96 GB) and a 32-core Threadripper 9970X.
 
 | Step | Measured | Per 10k hours of video |
 | --- | --- | --- |
 | Whisper large-v3 labels (batched, word timestamps) | 237× real time on 1 h of LibriSpeech audio | ~42 GPU-hours (~2 days locally) |
 | MediaPipe face landmarks (CPU) | 150 fps per process; 1,620 fps with 32 processes | ~155 hours locally (~6.5 days) or ~1,700 vCPU-hours in the cloud (~$50–100) |
-| Training, 30M model (3D-conv + ResNet18 front end, 12-layer conformer, width 256, CTC loss) | ~670 video-hours per GPU-hour (bf16) | ~15 GPU-hours per epoch |
-| Training, 10M "phone" model (half-width ResNet18, 8-layer conformer, width 192) | ~720 video-hours per GPU-hour | ~14 GPU-hours per epoch |
-| Storage of crops (estimate) | — | ~0.2–0.5 TB (1.7 TB free) |
+| FLARE features, once per clip (`extract_features.py`) | ~1,000× real time | ~10 GPU-hours |
+| Training the 40M model from saved features | ~4,000 video-hours per GPU-hour, 4 GiB of GPU memory | ~2.5 GPU-hours per pass |
+| Training the same model from video with FLARE in the loop (not used) | ~500 video-hours per GPU-hour | ~20 GPU-hours per pass |
+| Storage of mouth clips | 46 MB per video-hour | ~0.4 TB |
+| Storage of features | 131 MB per video-hour | ~1.3 TB |
 
 See [Is this machine enough?](#is-this-machine-enough) for run lengths and rental cost.
 
@@ -32,16 +36,16 @@ See [Is this machine enough?](#is-this-machine-enough) for run lengths and renta
 
 ## Is this machine enough?
 
-For the pilot and all data preparation, yes. A full-size run fits too, but takes about a month.
+Yes, for everything up to and including a 10,000-hour run. Saving FLARE's features once is what changed this: a training pass no longer decodes video or runs a large model.
 
-- **Measured training speed (2026-11-27):** 730–1,180 video-hours per GPU-hour, about 900 on average, on the pilot's second pass (clips up to 16 seconds, 9,600 frames per batch, 27 GiB of GPU memory, GPU to itself). It fell to about 150 while another job held the same GPU at 95%. The live figure is `video_hours_per_hour` in `data/train/runs/pilot/train.jsonl`.
-- **Pilot** (2,400 hours × 20 passes after a 2,000-hour short-clip stage, about 50,000 video-hours): about 2.5 days on this GPU alone, and up to 6 when other jobs share it.
-- **One full-size run** (10,000 hours × about 30 passes, plus a Whisper-feature pretraining stage of similar size, about 600,000 video-hours): about 670 GPU-hours. That is about 4 weeks on this machine, or 3.5 days on 8 rented GPUs of the same class for about $1,700 at $2.50 per GPU-hour.
-- **Whole programme** (three full-size runs and smaller ablations): about 2,700 GPU-hours. That is 4 months on this machine alone, or about $7k rented. The pretraining stage has not been run, so its cost is the least certain part.
+- **Pilot** (2,400 hours × 20 passes, about 48,000 video-hours): about 2.5 hours to extract features and about 12 hours to train, on this GPU.
+- **One full-size run** (10,000 hours × 30 passes, about 300,000 video-hours): about 10 GPU-hours of extraction and about 75 of training. That is 3 to 4 days on this machine alone. Several runs in parallel fit on the one card, at 4 GiB each.
+- **What a 10,000-hour run still needs:** the data. Downloading and cropping 7,600 more hours is CPU and network work (about 5 days of face tracking on this machine's 32 cores, by the MediaPipe measurement above). Their clips and features take about 1.35 TB, against about 1.3 TB free once the pilot's features are written, so finished clip shards have to move to object storage.
+- **Rented GPUs** would only buy speed: 8 GPUs would cut a full-size run from days to hours, for a few hundred dollars. The earlier estimate of about 2,700 GPU-hours ($7k) was for training from scratch and no longer applies.
 
-Rent GPUs only if the pilot shows a small model is worth scaling.
+These figures are measured speeds. What accuracy the small model reaches is not known until the pilot finishes.
 
-**Storage.** The pilot's clips take about 110 GB once converted (AVYT 47 GB, VoxCeleb2 64 GB). At the same encoding, 10,000 hours take 350–450 GB. Never keep source video: convert each file as it downloads and delete it. The machine has a 4 TB disk; move finished shards to object storage if free space drops below about 500 GB.
+**Storage.** Never keep source video: convert each file as it downloads and delete it. The machine has a 4 TB disk; move finished clip shards to object storage once their features are extracted if free space drops below about 500 GB.
 
 ## Training data
 
@@ -98,7 +102,7 @@ Train at 2.5k, 5k and 10k hours and plot the curve. Mine more data from YouTube-
 ## Phases
 
 1. **Baseline.** Score FLARE on public held-out video: WildVSR (5 hours of YouTube clips), the LRS3 test set, and speakers held out from Seamless Interaction. Webcam sentences recorded in the app ([EVALUATION.md](EVALUATION.md)) are an optional extra.
-2. **Pilot, about 2,400 hours, local (second attempt started 2026-11-27).** Train a 37M model on the AVYT and VoxCeleb2 mouth clips, which need no cropping or labelling ([TRAINING.md](TRAINING.md)). Score it against FLARE. The first attempt trained on text alone and never started reading lips, so the pilot now includes FLARE's cross-modal distillation with a Whisper-small teacher. Whether that is enough is not known until its dev WER falls.
-3. **Scale to 5k, then 10k hours.** Add Seamless Interaction, then MultiVSR. Build the crop pipeline for them. Move the teacher closer to FLARE's: Whisper-large codes computed once in advance, and face crops beside the lip crops.
+2. **Pilot, about 2,400 hours, local (started 2026-11-27).** Distill FLARE into a 40M model on the AVYT and VoxCeleb2 mouth clips, which need no cropping or labelling ([TRAINING.md](TRAINING.md)). Score it against FLARE on held-out VoxCeleb2 speakers, where FLARE's lip-only WER is 31%.
+3. **Scale to 5k, then 10k hours.** Add Seamless Interaction, then MultiVSR. Build the crop pipeline for them; the crops must match what FLARE's lip stream expects. Then try what the pilot leaves out: unfreezing the front end for a final pass on video, and a face stream beside the lip stream.
 4. **Phone.** Use chunked streaming attention, int8 ONNX, WebGPU through ONNX Runtime Web, and MediaPipe in the browser. Measure real-time factor and battery on two phones.
-5. **Optional.** Distill FLARE's visual-encoder features, and use a small language model for rescoring.
+5. **Optional.** Use a small language model for rescoring.
