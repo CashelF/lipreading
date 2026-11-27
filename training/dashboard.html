@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lipreader training</title>
+<style>
+.viz-root {
+  color-scheme: light;
+  --surface: var(--background, #fcfcfb);
+  --ink: var(--foreground, #0b0b0b);
+  --ink-2: var(--muted-foreground, #52514e);
+  --grid: var(--border, #e4e3df);
+  --s1: var(--chart-1, #2a78d6); --s2: var(--chart-2, #eb6834); --s3: var(--chart-3, #1baf7a); --s4: var(--chart-4, #eda100); --s5: var(--chart-5, #e87ba4); --s6: var(--chart-6, #008300); --s7: #6250d6; --s8: #e34948;
+  color: var(--ink); font: 14px/1.45 var(--font-sans, system-ui, sans-serif);
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) .viz-root {
+    color-scheme: dark;
+    --surface: var(--background, #1a1a19); --ink: var(--foreground, #f0efec); --ink-2: var(--muted-foreground, #c3c2b7);
+    --grid: var(--border, #383835);
+    --s1: var(--chart-1, #3987e5); --s2: var(--chart-2, #d95926); --s3: var(--chart-3, #199e70); --s4: var(--chart-4, #c98500); --s5: var(--chart-5, #d55181); --s6: var(--chart-6, #0ca30c); --s7: #9085e9; --s8: #e66767;
+  }
+}
+:root[data-theme="dark"] .viz-root {
+  color-scheme: dark;
+  --surface: var(--background, #1a1a19); --ink: var(--foreground, #f0efec); --ink-2: var(--muted-foreground, #c3c2b7);
+  --grid: var(--border, #383835);
+  --s1: var(--chart-1, #3987e5); --s2: var(--chart-2, #d95926); --s3: var(--chart-3, #199e70); --s4: var(--chart-4, #c98500); --s5: var(--chart-5, #d55181); --s6: var(--chart-6, #0ca30c); --s7: #9085e9; --s8: #e66767;
+}
+body.standalone { margin: 0; padding: 16px; background: #fcfcfb; }
+@media (prefers-color-scheme: dark) { body.standalone { background: #1a1a19; } }
+body.standalone .viz-root { max-width: 1100px; margin: 0 auto; }
+.viz-root h1 { font-size: 18px; margin: 0; }
+.viz-root h2 { font-size: 14px; margin: 0; }
+.viz-root p { margin: 2px 0 0; color: var(--ink-2); font-size: 12.5px; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 8px; margin: 12px 0; }
+.legend button { display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px; border: 1px solid var(--grid);
+  border-radius: 999px; background: none; color: var(--ink); font: inherit; font-size: 12.5px; cursor: pointer; }
+.legend button[aria-pressed="false"] { color: var(--ink-2); text-decoration: line-through; }
+.legend button[aria-pressed="false"] .key { opacity: .25; }
+.key { display: inline-block; width: 14px; height: 0; border-top: 2px solid; border-radius: 2px; }
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 12.5px; font-variant-numeric: tabular-nums; }
+th, td { text-align: right; padding: 4px 10px 4px 0; white-space: nowrap; border-bottom: 1px solid var(--grid); }
+th { color: var(--ink-2); font-weight: 500; }
+th:first-child, td:first-child { text-align: left; }
+.charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 22px 24px; margin-top: 20px; }
+.chart { position: relative; min-width: 0; }
+.chart svg { display: block; width: 100%; height: 210px; margin-top: 6px; touch-action: pan-y; }
+.chart text { fill: var(--ink-2); font-size: 11px; font-variant-numeric: tabular-nums; }
+.tip { position: absolute; z-index: 2; pointer-events: none; padding: 6px 9px; border: 1px solid var(--grid); border-radius: 6px;
+  background: var(--popover, var(--surface)); color: var(--ink); font-size: 12px; white-space: nowrap; box-shadow: 0 2px 8px rgb(0 0 0 / .15); }
+.tip div { display: flex; align-items: center; gap: 6px; }
+.tip .head, .tip .name { color: var(--ink-2); }
+.tip b { min-width: 46px; text-align: right; font-variant-numeric: tabular-nums; }
+details { margin-top: 20px; }
+summary { cursor: pointer; color: var(--ink-2); font-size: 12.5px; }
+</style>
+</head>
+<body>
+<div class="viz-root">
+  <h1>Lipreader training</h1>
+  <p id="read"></p>
+  <div class="legend" id="legend" role="group" aria-label="Runs shown"></div>
+  <div class="scroll"><table id="summary"></table></div>
+  <div class="charts" id="charts"></div>
+  <details><summary>Dev WER after every pass</summary><div class="scroll"><table id="passes"></table></div></details>
+</div>
+<script>
+let DATA = /*DATA*/null;
+const hidden = new Set();
+const NS = 'http://www.w3.org/2000/svg';
+const number = (value, digits = 0) => value.toLocaleString('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits });
+const percent = (value) => number(value * 100, 1) + '%';
+// One measure per chart, each with its own axis. x is always video-hours seen.
+const CHARTS = [
+  { title: 'Dev WER', note: 'Word error rate on the tracking clips after each pass. Lower is better; near 100% means it is not reading lips yet.',
+    points: (run) => run.passes.map((row) => [row[1], row[2]]), format: percent, tick: (v) => number(v * 100) + '%', zero: true, dots: true },
+  { title: 'CTC loss per token', note: 'Stays near 6 until the model starts matching lip shapes to words.',
+    points: (run) => run.steps.map((row) => [row[0], row[1]]), format: (v) => number(v, 2), tick: (v) => number(v, 1) },
+  { title: 'Attention loss per token', note: 'Falls to about 4 from word statistics alone; below that it is using the video.',
+    points: (run) => run.steps.map((row) => [row[0], row[2]]), format: (v) => number(v, 2), tick: (v) => number(v, 1) },
+  { title: 'Speed', note: 'Video-hours trained per hour. Drops when another job shares the GPU.',
+    points: (run) => run.steps.map((row) => [row[0], row[4]]), format: (v) => number(v), tick: (v) => number(v), zero: true },
+  { title: 'Learning rate', note: 'In units of 0.0001.',
+    points: (run) => run.steps.map((row) => [row[0], row[3] * 1e4]), format: (v) => number(v, 2), tick: (v) => number(v, 1), zero: true },
+];
+
+function element(name, attributes = {}, parent) {
+  const node = name === 'svg' || parent instanceof SVGElement ? document.createElementNS(NS, name) : document.createElement(name);
+  for (const [key, value] of Object.entries(attributes)) key === 'text' ? node.textContent = value : node.setAttribute(key, value);
+  if (parent) parent.append(node);
+  return node;
+}
+function ticks(low, high, count = 4) {
+  const span = high - low || 1, raw = span / count, power = 10 ** Math.floor(Math.log10(raw));
+  const step = [1, 2, 2.5, 5, 10].map((m) => m * power).find((s) => s >= raw);
+  const result = [];
+  for (let value = Math.ceil(low / step) * step; value <= high + step * 1e-6; value += step) result.push(+value.toFixed(10));
+  return result;
+}
+function thin(points, limit = 400) {  // Bucket means, so a long run still draws quickly.
+  if (points.length <= limit) return points;
+  const size = Math.ceil(points.length / limit), result = [];
+  for (let start = 0; start < points.length; start += size) {
+    const bucket = points.slice(start, start + size);
+    result.push([bucket[bucket.length - 1][0], bucket.reduce((sum, point) => sum + point[1], 0) / bucket.length]);
+  }
+  return result;
+}
+const colour = (index) => `var(--s${index % 8 + 1})`;
+const shown = () => DATA.runs.map((run, index) => ({ run, index })).filter(({ run }) => !hidden.has(run.name));
+
+function status(run) {
+  if (run.status === 'training') return 'training';
+  if (run.status === 'silent') return `no log for ${run.minutes_since_log} min`;
+  return run.status;
+}
+function finish(run) {
+  const recent = run.steps.slice(-20), last = run.steps[run.steps.length - 1];
+  if (run.status !== 'training' || !run.total_hours || !last) return '–';
+  const hours = (run.total_hours - last[0]) / (recent.reduce((sum, row) => sum + row[4], 0) / recent.length);
+  const when = new Date(Date.now() + hours * 3600e3);
+  return when.toLocaleString('en-US', { weekday: 'short', hour: 'numeric' }) + ` (${number(hours)} h)`;
+}
+
+function drawTables() {
+  document.getElementById('read').textContent = `Read ${DATA.read_at}. Updates every 30 seconds while this page is open.`;
+  const legend = document.getElementById('legend');
+  legend.replaceChildren();
+  DATA.runs.forEach((run, index) => {
+    const button = element('button', { type: 'button', 'aria-pressed': String(!hidden.has(run.name)) }, legend);
+    element('span', { class: 'key', style: `border-color:${colour(index)}` }, button);
+    element('span', { text: run.name }, button);
+    button.onclick = () => { hidden.has(run.name) ? hidden.delete(run.name) : hidden.add(run.name); draw(); };
+  });
+  const summary = document.getElementById('summary');
+  summary.replaceChildren();
+  const head = element('tr', {}, summary);
+  ['Run', 'Status', 'Passes', 'Video-hours', 'Dev WER', 'Best', 'CTC', 'Attention', 'Speed', 'Finishes'].forEach((text) => element('th', { text }, head));
+  DATA.runs.forEach((run, index) => {
+    const last = run.steps[run.steps.length - 1], pass = run.passes[run.passes.length - 1];
+    const row = element('tr', {}, summary), name = element('td', {}, row);
+    element('span', { class: 'key', style: `border-color:${colour(index)};margin-right:6px;vertical-align:middle` }, name);
+    name.append(run.name);
+    [status(run), run.passes.length, last ? number(last[0]) : '–', pass ? percent(pass[2]) : '–',
+      pass ? percent(Math.min(...run.passes.map((item) => item[2]))) : '–', last ? number(last[1], 2) : '–',
+      last ? number(last[2], 2) : '–', last ? number(last[4]) : '–', finish(run)].forEach((text) => element('td', { text }, row));
+  });
+  const passes = document.getElementById('passes');
+  passes.replaceChildren();
+  const top = element('tr', {}, passes);
+  ['Run', 'Pass', 'Video-hours', 'Dev WER', 'Dev loss'].forEach((text) => element('th', { text }, top));
+  for (const run of DATA.runs) for (const pass of run.passes) {
+    const row = element('tr', {}, passes);
+    [run.name, pass[0], number(pass[1]), percent(pass[2]), number(pass[3], 2)].forEach((text) => element('td', { text }, row));
+  }
+}
+
+function drawChart(chart, box) {
+  box.replaceChildren();
+  element('h2', { text: chart.title }, box);
+  element('p', { text: chart.note }, box);
+  const series = shown().map(({ run, index }) => ({ name: run.name, index, points: chart.points(run).filter((point) => point[1] != null) }))
+    .filter((item) => item.points.length);
+  const width = box.clientWidth, height = 210, left = 44, right = 12, top = 8, bottom = 34;
+  const svg = element('svg', { viewBox: `0 0 ${width} ${height}`, role: 'img', 'aria-label': `${chart.title} by video-hours seen` }, box);
+  if (!series.length) { element('text', { x: left, y: height / 2, text: 'No data yet' }, svg); return; }
+  const xs = series.flatMap((item) => item.points.map((point) => point[0]));
+  const ys = series.flatMap((item) => item.points.map((point) => point[1])).sort((a, b) => a - b);
+  // The first logged steps of a run are far off the scale of the rest; keep the axis on the bulk.
+  const high = (chart.dots ? ys[ys.length - 1] : ys[Math.floor((ys.length - 1) * 0.97)]) * 1.04;
+  const low = chart.zero ? 0 : ys[0] - (high - ys[0]) * 0.08;
+  const xMax = Math.max(...xs) || 1;
+  const x = (value) => left + (value / xMax) * (width - left - right);
+  const y = (value) => top + (1 - (Math.min(value, high) - low) / (high - low)) * (height - top - bottom);
+  for (const value of ticks(low, high)) {
+    element('line', { x1: left, x2: width - right, y1: y(value), y2: y(value), stroke: 'var(--grid)', 'stroke-width': 1 }, svg);
+    element('text', { x: left - 6, y: y(value) + 4, 'text-anchor': 'end', text: chart.tick(value) }, svg);
+  }
+  for (const value of ticks(0, xMax, width < 420 ? 3 : 5)) {
+    element('text', { x: x(value), y: height - bottom + 15, 'text-anchor': 'middle', text: number(value) }, svg);
+  }
+  element('text', { x: width - right, y: height - 3, 'text-anchor': 'end', text: 'video-hours seen' }, svg);
+  for (const item of series) {
+    const drawn = chart.dots ? item.points : thin(item.points);
+    element('path', { d: drawn.map((point, i) => `${i ? 'L' : 'M'}${x(point[0]).toFixed(1)},${y(point[1]).toFixed(1)}`).join(''),
+      fill: 'none', stroke: colour(item.index), 'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' }, svg);
+    for (const point of chart.dots ? drawn : drawn.slice(-1)) {
+      element('circle', { cx: x(point[0]), cy: y(point[1]), r: 4, fill: colour(item.index), stroke: 'var(--surface)', 'stroke-width': 2 }, svg);
+    }
+  }
+  // Hover: a crosshair finds the nearest logged point; one readout lists every run there.
+  const hair = element('line', { y1: top, y2: height - bottom, stroke: 'var(--ink-2)', 'stroke-width': 1, visibility: 'hidden' }, svg);
+  const tip = element('div', { class: 'tip', hidden: '' }, box);
+  const nearest = (points, value) => points.reduce((best, point) => Math.abs(point[0] - value) < Math.abs(best[0] - value) ? point : best);
+  const move = (event) => {
+    const bounds = svg.getBoundingClientRect();
+    const value = Math.max(0, Math.min(xMax, ((event.clientX - bounds.left) * width / bounds.width - left) / (width - left - right) * xMax));
+    const at = nearest(series.flatMap((item) => item.points), value)[0];
+    hair.setAttribute('x1', x(at)); hair.setAttribute('x2', x(at)); hair.setAttribute('visibility', 'visible');
+    tip.replaceChildren();
+    element('div', { class: 'head', text: `${number(at)} video-hours` }, tip);
+    for (const item of series) {
+      const row = element('div', {}, tip);
+      element('span', { class: 'key', style: `border-color:${colour(item.index)}` }, row);
+      element('b', { text: chart.format(nearest(item.points, at)[1]) }, row);
+      element('span', { class: 'name', text: item.name }, row);
+    }
+    tip.hidden = false;
+    const place = x(at) * bounds.width / width;
+    tip.style.top = `${svg.offsetTop + 4}px`;
+    tip.style.left = place > bounds.width / 2 ? '' : `${place + 10}px`;
+    tip.style.right = place > bounds.width / 2 ? `${bounds.width - place + 10}px` : '';
+  };
+  svg.addEventListener('pointermove', move);
+  svg.addEventListener('pointerdown', move);
+  svg.addEventListener('pointerleave', () => { hair.setAttribute('visibility', 'hidden'); tip.hidden = true; });
+}
+
+function draw() {
+  drawTables();
+  const charts = document.getElementById('charts');
+  CHARTS.forEach((chart, index) => drawChart(chart, charts.children[index] || element('div', { class: 'chart' }, charts)));
+}
+draw();
+let drawnWidth = innerWidth;
+addEventListener('resize', () => { if (innerWidth !== drawnWidth) { drawnWidth = innerWidth; draw(); } });
+if (document.body.classList.contains('standalone')) {
+  setInterval(async () => {
+    try { DATA = await (await fetch('data.json', { cache: 'no-store' })).json(); draw(); } catch { /* Keep the last curves. */ }
+  }, 30000);
+}
+</script>
+</body>
+</html>
