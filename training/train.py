@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import itertools
 import json
 import math
 import os
@@ -24,6 +25,7 @@ from torch.utils.data import DataLoader
 from backend.word_errors import corpus_wer, score
 from training.data import ClipBatches, prepare
 from training.model import LipReader
+from training.teacher import WhisperCodes
 from training.text import Vocabulary
 
 
@@ -48,7 +50,7 @@ def evaluate(model, loader, vocabulary, device, limit: int) -> dict:
         video, frames = video.to(device), frames.to(device)
         x = prepare(video, frames, train=False)
         with torch.autocast('cuda', torch.bfloat16):
-            loss, _, _ = model(x, frames, tokens.to(device), token_counts.to(device))
+            loss = model(x, frames, tokens.to(device), token_counts.to(device))[0]
             predictions = model.greedy(x, frames)
         losses.append(float(loss))
         rows += [score(text, vocabulary.decode(ids)) for text, ids in zip(texts, predictions)]
@@ -72,11 +74,16 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--weight-decay', type=float, default=0.03)
     parser.add_argument('--warmup', type=float, default=0.04, help='Share of all video hours spent warming up.')
+    parser.add_argument('--audio-weight', type=float, default=0.0,
+                        help='Weight of the loss for predicting the Whisper teacher\'s codes from the lips '
+                             '(training/teacher.py); 0 leaves audio unread.')
     parser.add_argument('--workers', type=int, default=20)
     parser.add_argument('--width', type=int, default=64)
     parser.add_argument('--dim', type=int, default=256)
     parser.add_argument('--layers', type=int, default=12)
     parser.add_argument('--dev-clips', type=int, default=1500)
+    parser.add_argument('--max-frames', type=int, default=400, help='Longest clip used, for training and dev.')
+    parser.add_argument('--init', type=Path, help='Checkpoint whose weights start a new run (ignored on resume).')
     parser.add_argument('--memory-gib', type=float, help='Cap on GPU memory, so other jobs on the card keep theirs.')
     parser.add_argument('--stop-after-steps', type=int, help='For smoke tests.')
     args = parser.parse_args()
@@ -96,16 +103,25 @@ def main():
     optimizer = torch.optim.AdamW([{'params': decay, 'weight_decay': args.weight_decay},
                                    {'params': plain, 'weight_decay': 0.0}], lr=args.lr, betas=(0.9, 0.98))
     state = {'step': 0, 'epoch': 0, 'hours_seen': 0.0, 'best_wer': None, 'restarts': 0, 'skipped': 0}
+    teacher = WhisperCodes.pretrained().to(device) if args.audio_weight else None
+    dev_shards = [str(path.resolve()) for path in args.dev]
     last = args.output / 'last.pt'
-    if last.exists():
-        checkpoint = torch.load(last, map_location=device, weights_only=False)
+    checkpoint = torch.load(last if last.exists() else args.init, map_location=device, weights_only=False) \
+        if last.exists() or args.init else {}
+    if checkpoint:
         model.load_state_dict(checkpoint['model'])
+    if last.exists():
         optimizer.load_state_dict(checkpoint['optimizer'])
         state.update(checkpoint['state'])
         state['restarts'] += 1
+    if teacher and 'teacher' in checkpoint:
+        teacher.load_state_dict(checkpoint['teacher'], strict=False)  # The same codes as the run being continued.
+    elif teacher:
+        sample = ClipBatches(dev_shards, args.vocabulary, frames_per_batch=args.frames_per_batch,
+                             max_frames=args.max_frames, shuffle=False, with_audio=True)
+        teacher.fit((audio.to(device), frames) for _, frames, _, _, audio in itertools.islice(sample, 8))
     total_hours = args.hours * args.epochs
     warmup_hours = total_hours * args.warmup
-    dev_shards = [str(path.resolve()) for path in args.dev]
 
     def training_shards():
         # Listed again every pass, so shards that finish converting later join in.
@@ -124,6 +140,7 @@ def main():
 
     def checkpoint_state():
         return {'model': model.state_dict(), 'optimizer': optimizer.state_dict(), 'state': state,
+                **({'teacher': teacher.code_state()} if teacher else {}),
                 'config': {'width': args.width, 'dim': args.dim, 'layers': args.layers, 'vocab_size': vocabulary.size}}
 
     stopping = False
@@ -135,27 +152,28 @@ def main():
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     log({'event': 'start', 'parameters_m': round(sum(p.numel() for p in model.parameters()) / 1e6, 1),
-         'train_shards': len(train_shards), 'dev_shards': len(dev_shards), **state})
+         'train_shards': len(train_shards), 'dev_shards': len(dev_shards), 'total_hours': total_hours, 'time': round(time.time()), **state})
     model.train()
     while state['epoch'] < args.epochs and not stopping:
         epoch = state['epoch']
-        # Curriculum: lipreading from scratch needs short clips first to learn alignment.
-        max_frames = 100 if epoch == 0 else 400
         train_shards = training_shards()
-        log({'event': 'pass', 'epoch': epoch, 'train_shards': len(train_shards), 'max_frames': max_frames})
+        log({'event': 'pass', 'epoch': epoch, 'train_shards': len(train_shards), 'max_frames': args.max_frames})
         dataset = ClipBatches(train_shards, args.vocabulary, frames_per_batch=args.frames_per_batch,
-                              max_frames=max_frames, seed=epoch * 100 + state['restarts'])
+                              max_frames=args.max_frames, seed=epoch * 100 + state['restarts'],
+                              with_audio=args.audio_weight > 0)
         loader = DataLoader(dataset, batch_size=None, num_workers=args.workers, prefetch_factor=4, pin_memory=True)
         window_start, window_frames, window = time.perf_counter(), 0, []
-        for video, frames, tokens, token_counts in loader:
+        for video, frames, tokens, token_counts, *audio in loader:
             lr = learning_rate(state['hours_seen'], total_hours, warmup_hours, args.lr)
             for group in optimizer.param_groups:
                 group['lr'] = lr
             try:
                 video = video.to(device, non_blocking=True)
                 x = prepare(video, frames, train=True)
+                sound = teacher(audio[0].to(device, non_blocking=True)) if teacher else None
                 with torch.autocast('cuda', torch.bfloat16):
-                    loss, ctc, attention = model(x, frames.to(device), tokens.to(device), token_counts.to(device))
+                    loss, ctc, attention, sound = model(x, frames.to(device), tokens.to(device), token_counts.to(device),
+                                                        audio=sound, audio_weight=args.audio_weight)
                 optimizer.zero_grad(set_to_none=True)
                 if torch.isfinite(loss):
                     loss.backward()
@@ -172,13 +190,14 @@ def main():
             clip_frames = int(frames.sum())
             state['hours_seen'] += clip_frames / 25 / 3600
             window_frames += clip_frames
-            window.append((float(loss.detach()), float(ctc), float(attention)))
+            window.append((float(loss.detach()), float(ctc), float(attention), float(sound)))
             if state['step'] % 100 == 0:
                 elapsed = time.perf_counter() - window_start
                 columns = list(zip(*window))
                 log({'step': state['step'], 'epoch': epoch, 'hours_seen': round(state['hours_seen'], 1),
-                     'loss': round(sum(columns[0]) / len(window), 4), 'ctc': round(sum(columns[1]) / len(window), 2),
-                     'attention': round(sum(columns[2]) / len(window), 4), 'lr': round(lr, 7),
+                     'loss': round(sum(columns[0]) / len(window), 4), 'ctc': round(sum(columns[1]) / len(window), 4),
+                     'attention': round(sum(columns[2]) / len(window), 4),
+                     'audio': round(sum(columns[3]) / len(window), 4), 'lr': round(lr, 7),
                      'skipped': state['skipped'], 'gpu_gib': round(torch.cuda.max_memory_reserved() / 2 ** 30, 1),
                      'video_hours_per_hour': round(window_frames / 25 / elapsed)})
                 window_start, window_frames, window = time.perf_counter(), 0, []
@@ -191,8 +210,8 @@ def main():
         if stopping:
             break
         state['epoch'] += 1
-        dev = ClipBatches(dev_shards, args.vocabulary, frames_per_batch=args.frames_per_batch, shuffle=False,
-                          with_text=True)
+        dev = ClipBatches(dev_shards, args.vocabulary, frames_per_batch=args.frames_per_batch,
+                          max_frames=args.max_frames, shuffle=False, with_text=True)
         result = evaluate(model, DataLoader(dev, batch_size=None, num_workers=2), vocabulary, device, args.dev_clips)
         log({'event': 'epoch', 'epoch': epoch, 'step': state['step'], 'hours_seen': round(state['hours_seen'], 1),
              **result})

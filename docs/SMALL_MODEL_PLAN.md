@@ -35,7 +35,7 @@ See [Is this machine enough?](#is-this-machine-enough) for run lengths and renta
 For the pilot and all data preparation, yes. A full-size run fits too, but takes about a month.
 
 - **Measured training speed (2026-11-27):** 730–1,180 video-hours per GPU-hour, about 900 on average, on the pilot's second pass (clips up to 16 seconds, 9,600 frames per batch, 27 GiB of GPU memory, GPU to itself). It fell to about 150 while another job held the same GPU at 95%. The live figure is `video_hours_per_hour` in `data/train/runs/pilot/train.jsonl`.
-- **Pilot** (2,500 hours × 20 passes, about 48,000 video-hours): about 2.5 days on this GPU alone.
+- **Pilot** (2,400 hours × 20 passes after a 2,000-hour short-clip stage, about 50,000 video-hours): about 2.5 days on this GPU alone, and up to 6 when other jobs share it.
 - **One full-size run** (10,000 hours × about 30 passes, plus a Whisper-feature pretraining stage of similar size, about 600,000 video-hours): about 670 GPU-hours. That is about 4 weeks on this machine, or 3.5 days on 8 rented GPUs of the same class for about $1,700 at $2.50 per GPU-hour.
 - **Whole programme** (three full-size runs and smaller ablations): about 2,700 GPU-hours. That is 4 months on this machine alone, or about $7k rented. The pretraining stage has not been run, so its cost is the least certain part.
 
@@ -98,7 +98,7 @@ Train at 2.5k, 5k and 10k hours and plot the curve. Mine more data from YouTube-
 ## Phases
 
 1. **Baseline.** Score FLARE on public held-out video: WildVSR (5 hours of YouTube clips), the LRS3 test set, and speakers held out from Seamless Interaction. Webcam sentences recorded in the app ([EVALUATION.md](EVALUATION.md)) are an optional extra.
-2. **Pilot, about 2,500 hours, local (started 2026-11-27).** Train a 37M model on the AVYT and VoxCeleb2 mouth clips, which need no cropping or labelling ([TRAINING.md](TRAINING.md)). Score it against FLARE.
-3. **Scale to 5k, then 10k hours.** Add Seamless Interaction, then MultiVSR. Build the crop pipeline for them. Add FLARE-style Whisper-feature pretraining.
+2. **Pilot, about 2,400 hours, local (second attempt started 2026-11-27).** Train a 37M model on the AVYT and VoxCeleb2 mouth clips, which need no cropping or labelling ([TRAINING.md](TRAINING.md)). Score it against FLARE. The first attempt trained on text alone and never started reading lips, so the pilot now includes FLARE's cross-modal distillation with a Whisper-small teacher. Whether that is enough is not known until its dev WER falls.
+3. **Scale to 5k, then 10k hours.** Add Seamless Interaction, then MultiVSR. Build the crop pipeline for them. Move the teacher closer to FLARE's: Whisper-large codes computed once in advance, and face crops beside the lip crops.
 4. **Phone.** Use chunked streaming attention, int8 ONNX, WebGPU through ONNX Runtime Web, and MediaPipe in the browser. Measure real-time factor and battery on two phones.
 5. **Optional.** Distill FLARE's visual-encoder features, and use a small language model for rescoring.

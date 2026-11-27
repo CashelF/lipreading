@@ -8,6 +8,8 @@ from torch import nn
 import torch.nn.functional as F
 from torchaudio.models import Conformer
 
+from training.teacher import CODES
+
 
 class BasicBlock(nn.Module):
     def __init__(self, inputs: int, outputs: int, stride: int):
@@ -66,6 +68,7 @@ class LipReader(nn.Module):
         self.project = nn.Linear(self.frontend.dim, dim)
         self.encoder = Conformer(dim, heads, 4 * dim, layers, 31, dropout=dropout)
         self.ctc = nn.Linear(dim, vocab_size)
+        self.audio = nn.Linear(dim, 2 * CODES)  # Training only: the teacher's two codes for each frame.
         self.embed = nn.Embedding(vocab_size, dim)
         layer = nn.TransformerDecoderLayer(dim, heads, 4 * dim, dropout, batch_first=True, norm_first=True)
         self.decoder = nn.TransformerDecoder(layer, decoder_layers, norm=nn.LayerNorm(dim))
@@ -86,12 +89,17 @@ class LipReader(nn.Module):
         y = self.decoder(x, states, tgt_mask=causal, memory_key_padding_mask=padding)
         return self.output(y)
 
-    def forward(self, video, lengths, targets, target_lengths, *, ctc_weight: float = 0.1, smoothing: float = 0.1):
-        """targets: (B, U) padded with 0. Returns (loss, ctc_loss, attention_loss)."""
+    def forward(self, video, lengths, targets, target_lengths, *, audio=None, audio_weight: float = 0.0,
+                ctc_weight: float = 0.1, smoothing: float = 0.1):
+        """targets: (B, U) padded with 0; audio: codes from ``teacher.WhisperCodes`` (B, T, 2), or None.
+
+        Returns (loss, ctc_loss, attention_loss, audio_loss): the text losses per token, the audio loss per code.
+        """
         states, lengths, padding = self.encode(video, lengths)
         log_probs = self.ctc(states).float().log_softmax(-1).transpose(0, 1)
+        # Both losses are per token, so the weights mean what they say whatever the clip length.
         ctc = F.ctc_loss(log_probs, targets, lengths, target_lengths, blank=0, reduction='sum', zero_infinity=True)
-        ctc = ctc / video.shape[0]
+        ctc = ctc / target_lengths.sum()
         batch, longest = targets.shape
         sos = torch.full((batch, 1), self.sos_eos, dtype=targets.dtype, device=targets.device)
         valid = torch.arange(longest + 1, device=targets.device)[None] <= target_lengths[:, None]
@@ -102,7 +110,14 @@ class LipReader(nn.Module):
         logits = self.decode_step(decoder_input, states, padding).float()
         attention = F.cross_entropy(logits.flatten(0, 1), expected.flatten(), ignore_index=-100,
                                     label_smoothing=smoothing)
-        return ctc_weight * ctc + (1 - ctc_weight) * attention, ctc.detach(), attention.detach()
+        sound = ctc.new_zeros(())
+        if audio is not None:
+            # Text gives one signal per clip; the teacher's codes give two per frame, and they are
+            # what lets a model trained from scratch start telling mouth shapes apart.
+            logits = self.audio(states).float().unflatten(-1, (2, CODES))[~padding]
+            sound = F.cross_entropy(logits.flatten(0, 1), audio[:, :states.shape[1]][~padding].flatten())
+        loss = ctc_weight * ctc + (1 - ctc_weight) * attention + audio_weight * sound
+        return loss, ctc.detach(), attention.detach(), sound.detach()
 
     @torch.no_grad()
     def greedy(self, video, lengths, max_tokens: int = 120) -> list[list[int]]:
