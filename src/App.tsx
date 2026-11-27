@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { ArrowDownToLine, ArrowUpRight, Camera, CameraOff, Check, ChevronDown, CircleHelp, Copy, Expand, Focus, LoaderCircle, MicOff, Play, Settings2, ShieldCheck, Square, Trash2, X } from 'lucide-react';
 import SpeakingExamples from './SpeakingExamples';
+import EvalSentences from './EvalSentences';
 import LatencyPanel from './LatencyPanel';
 import { LatencyTracker, type LatencySample } from './latency';
 import { captureSize } from './capture';
@@ -37,7 +38,8 @@ export default function App() {
   const [copied, setCopied] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
-  const [showExamples, setShowExamples] = useState(false);
+  const [recorder, setRecorder] = useState<'examples' | 'sentences' | null>(null);
+  const showExamples = recorder !== null;
   const [mirrored, setMirrored] = useState(true);
   const [elapsed, setElapsed] = useState(0);
   const [latencySamples, setLatencySamples] = useState<LatencySample[]>([]);
@@ -63,7 +65,7 @@ export default function App() {
   const stopRequested = useRef(false);
   const transcriptText = transcripts.map((transcript) => transcript.text).filter(Boolean).join('\n\n');
   const busy = mode !== 'idle';
-  const closeExamples = useCallback(() => setShowExamples(false), []);
+  const closeExamples = useCallback(() => setRecorder(null), []);
   const activityLabel = activity ? ACTIVITY_LABELS[activity.state] : null;
 
   useEffect(() => {
@@ -517,7 +519,8 @@ export default function App() {
 
         <div className="session-feedback" role="status"><span className={`status-dot ${model.ready ? 'green' : 'amber'}`} /><p>{feedback}</p>{!model.ready && <button className="refresh-button" onClick={() => void retryModel()} disabled={retrying || model.loading} aria-label="Retry loading model">{retrying || model.loading ? 'Loading…' : 'Retry'}<ArrowUpRight size={13} /></button>}</div>
       </main>
-      {showExamples && <SpeakingExamples videoRef={videoRef} cameraOn={cameraOn} onClose={closeExamples} />}
+      {recorder === 'examples' && <SpeakingExamples videoRef={videoRef} cameraOn={cameraOn} onClose={closeExamples} />}
+      {recorder === 'sentences' && <EvalSentences videoRef={videoRef} cameraOn={cameraOn} onClose={closeExamples} />}
       {showHelp && <div className="modal-backdrop" onClick={() => setShowHelp(false)}><section className="help-modal" role="dialog" aria-modal="true" aria-labelledby="help-title" onClick={(event) => event.stopPropagation()}>
         <button className="icon-button modal-close" aria-label="Close help" onClick={() => setShowHelp(false)} autoFocus><X size={20} /></button>
         <h2 id="help-title">Reading with Still</h2>
@@ -528,7 +531,7 @@ export default function App() {
         </ol>
         <p className="help-note">Each phrase can run up to {utteranceSeconds} seconds; pauses let your session continue. You can change phrase length in Settings. Lip reading can misinterpret words, so review your transcript.</p>
         <p className="help-note">Powered by {model.model || 'FLARE-LLM Large'} on this machine. Camera frames go to the inference server; your microphone is never used.</p>
-        <details className="help-tools"><summary>Troubleshooting</summary><p>Record examples if you need help with missed speech or unwanted words.</p><button className="examples-open" disabled={busy || cameraLoading} onClick={() => { setShowHelp(false); setShowExamples(true); }}>Record examples <ArrowUpRight size={13} /></button><LatencyPanel samples={latencySamples} /></details>
+        <details className="help-tools"><summary>Troubleshooting</summary><p>Record examples if you need help with missed speech or unwanted words. Record sentences to measure word accuracy.</p><span className="examples-open-row"><button className="examples-open" disabled={busy || cameraLoading} onClick={() => { setShowHelp(false); setRecorder('examples'); }}>Record examples <ArrowUpRight size={13} /></button><button className="examples-open" disabled={busy || cameraLoading} onClick={() => { setShowHelp(false); setRecorder('sentences'); }}>Record sentences <ArrowUpRight size={13} /></button></span><LatencyPanel samples={latencySamples} /></details>
         <button className="read-button help-done" onClick={() => setShowHelp(false)}>Got it <Check size={15} /></button>
       </section></div>}
     </div>
