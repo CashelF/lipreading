@@ -1,14 +1,14 @@
 # Plan: a phone-sized lipreader
 
-Status: **proposal, measured 2026-11-26.** Nothing here is in the live app.
+Status: **proposal; costs measured and data surveyed 2026-11-26.** Nothing here is in the live app.
 
-Goal: run lipreading in a phone browser in real time, with word accuracy equal to FLARE-LLM Large or slightly worse, measured on the held-out webcam set ([EVALUATION.md](EVALUATION.md)).
+Goal: run lipreading in a phone browser in real time, with word accuracy equal to FLARE-LLM Large or slightly worse, measured on held-out video (see Phases).
 
 ## Approach
 
 Train a small streaming model from scratch. Don't scale FLARE up or post-train it.
 
-- About 85% of FLARE's parameters are its 7B Qwen decoder, which mostly supplies language knowledge. Published visual-only conformers (a compact speech-model architecture) of a few hundred million parameters or less reached LRS3 WER in the low teens when trained on roughly 100k hours of video. A 250M model trained on 3.4k hours reached about 19%. These are published numbers, not reproduced here. Scaling data mattered more than model size.
+- About 95% of FLARE's parameters are its 7B Qwen decoder, which mostly supplies language knowledge. In the FLARE paper the same 342M visual model scores 15.9% LRS3 WER with a small 58M decoder and 13.2% with Qwen, so the LLM is worth under 3 points. See [Is 10k hours enough?](#is-10k-hours-enough) for the published data-scaling results.
 - **Labels come from audio.** Whisper transcribes each training video's soundtrack, and the lipreader learns from the silent frames only. At run time the app still never uses audio.
 - **FLARE can't label at scale.** It took 2.9 s of GPU time to decode a 4 s clip (beam 30), so labelling 10k hours would take about 7,200 GPU-hours. FLARE's visual-encoder features are a cheaper optional teacher, because they need no language-model decoding.
 
@@ -32,23 +32,62 @@ A full run of about 50 epochs over 10k hours takes ~750 GPU-hours. That's about 
 
 **Phone compute:** the 30M model needs 16.7 GFLOPs per second of video, and the 10M model needs 4.7. Both look affordable for a recent phone GPU over WebGPU, but that hasn't been measured on a phone. A WebGPU benchmark is the first phone step.
 
-## The decision: training data
+## Training data
 
-Data is the expensive, one-way choice.
+Surveyed 2026-11-26. Hours are English speech unless noted. "Checked" means the files or links were opened from this machine that day.
 
-| Source | Hours (English) | Terms |
+### Ready to download (real video files)
+
+| Source | Hours | What it is | Terms | Checked |
+| --- | --- | --- | --- | --- |
+| [AVYT](https://huggingface.co/datasets/nguyenvulebinh/AVYT) `avyt/talking-train` | ~1,450 | 96×96 colour mouth clips at 25 fps with audio and transcripts, cut from in-the-wild YouTube. FLARE trained on this set. | No license stated; source videos belong to their uploaders | Ungated; 544 GB; a shard opened and played |
+| Same repo, `vox2/` | ~1,100–1,300 | VoxCeleb2 (celebrity interviews) English clips in the same format | As above | Ungated; 64 GB; a shard opened |
+| [Seamless Interaction](https://huggingface.co/datasets/facebook/seamless-interaction) (Meta) | ~7,000 on camera, roughly half of it speech | 4,000+ recruited participants in two-person conversations. One 1080p–4K full-body video per person, with word-timed transcripts. Faces are 160–600 px wide. | CC BY-NC 4.0 | Ungated; video and transcript fetch per file; ~17 TB of video, so crop while streaming |
+| [AVSpeech mirror](https://huggingface.co/datasets/ProgramComputer/avspeech-visual-audio) | ~1,550 (4,700 all languages) | YouTube clips, 3–10 s each; no transcripts | Gated (auto-approve); no license stated | Listing only; 2.9 TB |
+| [LRS3 mirror](https://huggingface.co/datasets/TheNHz/ellipsis-lrs3-raw) | ~430 | TED talks with human transcripts. The official Oxford download is gone (page 404; the KAIST mirror says downloads ended). | Gated (auto-approve); unofficial and about 13% of clips missing | Listing only; 150 GB |
+
+### YouTube lists (ids, timestamps and labels; the video must be fetched from YouTube)
+
+| Source | Hours | Notes |
 | --- | --- | --- |
-| LRS3 (TED) | ~430 | Research, non-commercial; access by request |
-| VoxCeleb2 | ~2,400 | Annotations CC BY-SA; the videos belong to their YouTube owners |
-| AVSpeech | ~4,700 | Annotations CC BY; the videos are YouTube links, and bulk download conflicts with YouTube's terms |
-| Paid, consented recordings | Any | Clean rights; rough estimate $30–60 per hour of contributor time |
+| [MultiVSR](https://huggingface.co/datasets/sindhuhegde/multivsr) (Oxford, 2025) | 5,859 (12k all languages) | Full videos behind the AVSpeech ids, filtered to a visible, in-sync speaker, with Whisper large-v3 word timings. Annotations are MIT. 284 of 300 sampled English videos still exist (95%). Overlaps AVSpeech. |
+| [VoxBlink2](https://voxblink2.github.io) | Part of 16,672 | 111k speakers in 18 languages, English the largest. No transcripts. CC BY-NC-SA. |
+| [SpeakerVid-5M](https://huggingface.co/datasets/dorni/SpeakerVid-5M-Dataset) | Part of 8,743 | Interviews, news and talk shows, 83k speakers, Whisper transcripts. Many half-body and side views. Research only. |
+| [TalkVerse](https://huggingface.co/datasets/zhenzhiwang/TalkVerse) | Part of 6,300 | Single-person clips with ASR text. Gated; license "other". |
+| [YouTube-Commons](https://huggingface.co/datasets/PleIAs/YouTube-Commons) | Not measured | Links and transcripts for 3.2M CC BY videos, 71% English. The only source here whose videos carry a reuse license. The share showing a usable talking face is unknown; measure it on a sample first. |
 
-Recommendation: run a research prototype on LRS3 + VoxCeleb2 + AVSpeech, which is about 3.5k hours, the same mix Auto-AVSR used. It will show whether this approach can reach FLARE's webcam WER. Settle data rights before any public or commercial release.
+Not usable: LRS2 (BBC agreement, academic research only) and the official VoxCeleb2 site (it no longer serves the links).
+
+**Rights.** Nothing at this scale is cleared for commercial use. Every set is research-only, non-commercial or unlicensed, and bulk downloading from YouTube conflicts with its terms of service. A model trained on them is a research prototype. A public release needs either YouTube-Commons-style CC BY video or licensed recordings.
+
+**Reaching 10k hours.** The ready-to-download rows give about 8,000 hours. MultiVSR adds about 4,300 more after its AVSpeech overlap.
+
+### Is 10k hours enough?
+
+It's enough to learn whether a phone-sized model can get close to FLARE. It probably isn't enough to match it.
+
+Published lip-only LRS3 results, all as cited in the [FLARE paper](https://arxiv.org/abs/2610.19559), Table 2:
+
+| Model | Parameters | Training hours | LRS3 WER |
+| --- | --- | --- | --- |
+| Auto-AVSR | 186M | 1,902 → 3,448 | 23.5% → 19.1% |
+| FLARE Base, small decoder | 117M | 1,759 → 4,966 | 23.4% → 18.5% |
+| FLARE Large, small decoder | 342M | 4,966 | 15.9% |
+| FLARE Large + 7B Qwen (the live app) | 342M + 7B | 4,966 | 13.2% |
+| ViT3D (Google) | 135M | 90,000 | 17.0% |
+| LP-Conformer (Google) | 410M | 100,000 | 12.8% |
+
+- Doubling data from about 2k to 4–5k hours cut 4–5 points. The curve flattens after that: 90k hours with a 135M model reached only 17.0%.
+- FLARE's training method was worth more than data. It pretrains the lipreader to predict Whisper's audio features and feeds both face and lip crops. Its 117M model on 5k hours (18.5%) is close to Google's 135M model on 90k hours (17.0%). Copy that method.
+- No published result exists for a 10–30M streaming model. Our estimate, not a measurement: 17–22% on LRS3 at 10k hours with FLARE-style pretraining, against FLARE-LLM's 13.2%.
+- Out-of-domain video is harder. FLARE-LLM scores 34.3% on WildVSR (YouTube clips unlike its training data). Variety of speakers, cameras and lighting matters more for webcam accuracy than raw hours.
+
+Train at 2.5k, 5k and 10k hours and plot the curve. Mine more data from YouTube-Commons only if the curve is still falling at 10k.
 
 ## Phases
 
-1. **Baseline.** Record the held-out sentences with several speakers. Score FLARE in live and model modes.
-2. **Pilot, about 1k hours, local, about 2 weeks.** Build the crop and label pipeline. Train the 30M model and score it in model mode against FLARE.
-3. **Scale to 3.5k hours, then 10k.** Add self-supervised pretraining if the pilot WER curve flattens.
+1. **Baseline.** Score FLARE on public held-out video: WildVSR (5 hours of YouTube clips), the LRS3 test set, and speakers held out from Seamless Interaction. Webcam sentences recorded in the app ([EVALUATION.md](EVALUATION.md)) are an optional extra.
+2. **Pilot, about 2,500 hours, local, about 2 weeks.** Train the 30M model on the AVYT and VoxCeleb2 mouth clips, which need no cropping or labelling. Score it against FLARE.
+3. **Scale to 5k, then 10k hours.** Add Seamless Interaction, then MultiVSR. Build the crop pipeline for them. Add FLARE-style Whisper-feature pretraining.
 4. **Phone.** Use chunked streaming attention, int8 ONNX, WebGPU through ONNX Runtime Web, and MediaPipe in the browser. Measure real-time factor and battery on two phones.
 5. **Optional.** Distill FLARE's visual-encoder features, and use a small language model for rescoring.
