@@ -2,6 +2,8 @@
 
 Normal reading never calls this module. Frames remain in bounded memory until
 the user finishes a sample; only then are the original JPEGs saved locally.
+Two collections share this code: eight-second speaking-filter examples and
+held-out read sentences for word error rate (see docs/EVALUATION.md).
 """
 from __future__ import annotations
 
@@ -30,15 +32,39 @@ MAX_SAMPLES = 100
 SESSION_TIMEOUT_SECONDS = 30
 SAMPLE_ID = re.compile(r'[0-9a-f]{32}\Z')
 DEFAULT_ROOT = Path(__file__).resolve().parents[1] / 'data' / 'speaking-examples'
+SENTENCE_ROOT = Path(__file__).resolve().parents[1] / 'data' / 'eval-sentences'
+SENTENCE_PROMPTS = Path(__file__).resolve().with_name('eval_sentences.json')
+MAX_SENTENCE_SAMPLES = 2000
+SPEAKER = re.compile(r'[A-Za-z0-9_-]{1,16}\Z')
+EXAMPLE_KEYS = ('id', 'label', 'take', 'frames', 'duration_seconds')
+SENTENCE_KEYS = ('id', 'prompt_id', 'speaker', 'frames', 'duration_seconds')
+
+
+def load_prompts(path: Path = SENTENCE_PROMPTS) -> dict[str, str]:
+    """Fixed public prompt list: ids stay stable so recordings keep their reference."""
+    sentences = json.loads(path.read_text())['sentences']
+    prompts = {item['id']: item['text'] for item in sentences}
+    if len(prompts) != len(sentences):
+        raise ValueError('Duplicate evaluation sentence id.')
+    return prompts
+
+
+PROMPTS = load_prompts()
 
 
 class ExampleBuffer:
+    min_seconds, max_seconds = 6, 10
+    length_message = 'Keep each sample between six and ten seconds.'
+
     def __init__(self, label: str, take: int):
         if not isinstance(label, str) or label not in LABELS:
             raise ValueError('Choose a valid speaking example.')
         if type(take) is not int or take not in (1, 2):
             raise ValueError('Take must be 1 or 2.')
         self.label, self.take = label, take
+        self._reset()
+
+    def _reset(self):
         self.frames: list[Frame] = []
         self.total_bytes = 0
         self.dimensions: tuple[int, int] | None = None
@@ -50,8 +76,8 @@ class ExampleBuffer:
         frame = parse_packet(packet, previous)
         if previous is not None and frame.timestamp - previous > 250:
             raise ValueError('Camera frames were interrupted. Record this sample again.')
-        if self.frames and frame.timestamp - self.frames[0].timestamp > 10_000:
-            raise ValueError('Keep each sample between six and ten seconds.')
+        if self.frames and frame.timestamp - self.frames[0].timestamp > self.max_seconds * 1000:
+            raise ValueError(self.length_message)
         try:
             with Image.open(BytesIO(frame.jpeg)) as image:
                 if image.format != 'JPEG' or not (96 <= image.width <= 1280 and 96 <= image.height <= 960):
@@ -68,22 +94,51 @@ class ExampleBuffer:
         self.frames.append(frame)
         self.total_bytes += len(packet)
 
-    def metadata(self) -> dict:
+    def timing(self) -> dict:
         if len(self.frames) < 2:
-            raise ValueError('Record a full eight-second sample before saving.')
+            raise ValueError('Record a full sample before saving.')
         duration = (self.frames[-1].timestamp - self.frames[0].timestamp) / 1000
-        if not 6 <= duration <= 10:
-            raise ValueError('Keep each sample between six and ten seconds.')
+        if not self.min_seconds <= duration <= self.max_seconds:
+            raise ValueError(self.length_message)
         capture_fps = (len(self.frames) - 1) / duration
         if capture_fps < 15:
             raise ValueError('Camera frames arrived too slowly. Improve lighting and record this sample again.')
-        return {'label': self.label, 'take': self.take, 'frames': len(self.frames),
-                'duration_seconds': round(duration, 3), 'capture_fps': round(capture_fps, 3)}
+        return {'frames': len(self.frames), 'duration_seconds': round(duration, 3),
+                'capture_fps': round(capture_fps, 3)}
+
+    def metadata(self) -> dict:
+        return {'label': self.label, 'take': self.take, **self.timing()}
+
+    def conflicts(self, saved: dict) -> bool:
+        return False
+
+
+class SentenceBuffer(ExampleBuffer):
+    """One read prompt sentence, kept as a held-out word error rate clip."""
+    min_seconds, max_seconds = 1.5, 15
+    length_message = 'Keep each sentence recording between 1.5 and 15 seconds.'
+
+    def __init__(self, prompt_id: str, speaker: str):
+        if not isinstance(prompt_id, str) or prompt_id not in PROMPTS:
+            raise ValueError('Choose a sentence from the list.')
+        if not isinstance(speaker, str) or not SPEAKER.fullmatch(speaker):
+            raise ValueError('Use a speaker code of 1–16 letters, digits, - or _.')
+        self.prompt_id, self.speaker = prompt_id, speaker
+        self._reset()
+
+    def metadata(self) -> dict:
+        return {'label': 'sentence', 'prompt_id': self.prompt_id, 'speaker': self.speaker,
+                'reference': PROMPTS[self.prompt_id], **self.timing()}
+
+    def conflicts(self, saved: dict) -> bool:
+        return saved['prompt_id'] == self.prompt_id and saved['speaker'] == self.speaker
 
 
 class ExampleStore:
-    def __init__(self, root: Path = DEFAULT_ROOT):
-        self.root = root
+    def __init__(self, root: Path = DEFAULT_ROOT, keys: tuple[str, ...] = EXAMPLE_KEYS,
+                 max_samples: int | None = None):
+        self.root, self.keys = root, keys
+        self.max_samples = max_samples
 
     def _sample_path(self, sample_id: str) -> Path:
         if not SAMPLE_ID.fullmatch(sample_id):
@@ -102,8 +157,7 @@ class ExampleStore:
                 continue
             try:
                 manifest = json.loads((path / 'manifest.json').read_text())
-                samples.append({key: manifest[key] for key in
-                                ('id', 'label', 'take', 'frames', 'duration_seconds')})
+                samples.append({key: manifest[key] for key in self.keys})
             except (OSError, ValueError, KeyError, TypeError):
                 continue
         return samples
@@ -112,8 +166,11 @@ class ExampleStore:
         metadata = buffer.metadata()
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.root.chmod(0o700)
-        if len(self.list()) >= MAX_SAMPLES:
+        saved = self.list()
+        if len(saved) >= (self.max_samples or MAX_SAMPLES):
             raise ValueError('The local sample collection is full. Delete old samples before recording more.')
+        if any(buffer.conflicts(item) for item in saved):
+            raise ValueError('This speaker already recorded this sentence. Delete it first to record it again.')
         sample_id = uuid.uuid4().hex
         destination = self._sample_path(sample_id)
         staging = Path(tempfile.mkdtemp(prefix='.pending-', dir=self.root))
@@ -130,7 +187,7 @@ class ExampleStore:
         finally:
             if staging.exists():
                 shutil.rmtree(staging)
-        return {key: manifest[key] for key in ('id', 'label', 'take', 'frames', 'duration_seconds')}
+        return {key: manifest[key] for key in self.keys}
 
     @staticmethod
     def _write_private(path: Path, contents: bytes):
@@ -146,32 +203,55 @@ class ExampleStore:
 
 
 store = ExampleStore()
+sentence_store = ExampleStore(SENTENCE_ROOT, SENTENCE_KEYS, MAX_SENTENCE_SAMPLES)
 
 
 def create_examples_router(allowed_origin: Callable, get_session_lock: Callable) -> APIRouter:
     router = APIRouter()
 
-    @router.get('/api/examples')
-    async def list_examples(request: Request):
+    def check_origin(request: Request, required: bool):
         origin = request.headers.get('origin')
-        if origin and not allowed_origin(origin, request.headers.get('host')):
+        if (required or origin) and not allowed_origin(origin, request.headers.get('host')):
             raise HTTPException(status_code=403, detail='Origin is not allowed.')
-        return await asyncio.to_thread(store.list)
 
-    @router.delete('/api/examples/{sample_id}')
-    async def delete_example(sample_id: str, request: Request):
-        if not allowed_origin(request.headers.get('origin'), request.headers.get('host')):
-            raise HTTPException(status_code=403, detail='Origin is not allowed.')
+    async def delete_from(collection: ExampleStore, sample_id: str, request: Request):
+        check_origin(request, required=True)
         try:
-            await asyncio.to_thread(store.delete, sample_id)
+            await asyncio.to_thread(collection.delete, sample_id)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail='Sample was not found.') from exc
         return {'deleted': sample_id}
 
+    @router.get('/api/examples')
+    async def list_examples(request: Request):
+        check_origin(request, required=False)
+        return await asyncio.to_thread(store.list)
+
+    @router.delete('/api/examples/{sample_id}')
+    async def delete_example(sample_id: str, request: Request):
+        return await delete_from(store, sample_id, request)
+
     @router.websocket('/api/examples')
     async def capture_example(ws: WebSocket):
+        await capture(ws, store, lambda command: ExampleBuffer(command.get('label'), command.get('take')))
+
+    @router.get('/api/eval-sentences')
+    async def list_sentences(request: Request):
+        check_origin(request, required=False)
+        prompts = [{'id': key, 'text': text} for key, text in PROMPTS.items()]
+        return {'prompts': prompts, 'recordings': await asyncio.to_thread(sentence_store.list)}
+
+    @router.delete('/api/eval-sentences/{sample_id}')
+    async def delete_sentence(sample_id: str, request: Request):
+        return await delete_from(sentence_store, sample_id, request)
+
+    @router.websocket('/api/eval-sentences')
+    async def capture_sentence(ws: WebSocket):
+        await capture(ws, sentence_store, lambda command: SentenceBuffer(command.get('prompt_id'), command.get('speaker')))
+
+    async def capture(ws: WebSocket, collection: ExampleStore, create_buffer: Callable[[dict], ExampleBuffer]):
         if not allowed_origin(ws.headers.get('origin'), ws.headers.get('host')):
             await ws.close(code=1008)
             return
@@ -207,12 +287,12 @@ def create_examples_router(allowed_origin: Callable, get_session_lock: Callable)
                 if kind == 'start':
                     if buffer is not None:
                         raise ValueError('This sample has already started.')
-                    buffer = ExampleBuffer(command.get('label'), command.get('take'))
+                    buffer = create_buffer(command)
                     await ws.send_json({'type': 'ready'})
                 elif kind == 'stop':
                     if buffer is None:
                         raise ValueError('Start a sample before saving it.')
-                    result = await asyncio.to_thread(store.save, buffer)
+                    result = await asyncio.to_thread(collection.save, buffer)
                     await ws.send_json({'type': 'saved', **result})
                     return
                 elif kind == 'cancel':

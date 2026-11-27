@@ -46,6 +46,8 @@ For camera/UI changes, check Start/Stop, guidance recovery, mirroring, paragraph
 
 Automated tests do **not** measure word accuracy. Use real checkpoints and consented local video for inference checks. Do not run a competing session or GPU benchmark while someone is using the app.
 
+Word accuracy is measured on held-out read sentences recorded under **Help → Troubleshooting → Record sentences** and scored by `scripts/evaluate_sentences.py`; see [EVALUATION.md](EVALUATION.md). The proposal for a phone-sized model is in [SMALL_MODEL_PLAN.md](SMALL_MODEL_PLAN.md).
+
 The optional recorder is under **Help → Troubleshooting → Record examples**. It collects four eight-second conditions: quiet stillness, quiet movement, normal speech, and subtle speech. Examples stay in ignored `data/speaking-examples/`; the panel can delete them. No recordings or private reports are included in this repository.
 
 ```bash

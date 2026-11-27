@@ -1,0 +1,406 @@
+{
+ "version": 1,
+ "source": "Original everyday sentences written for Still; numbers spelled out.",
+ "sentences": [
+  {
+   "id": "s001",
+   "text": "Could you pass me the salt, please?"
+  },
+  {
+   "id": "s002",
+   "text": "I think the meeting got moved to Thursday afternoon."
+  },
+  {
+   "id": "s003",
+   "text": "We should leave early to beat the traffic."
+  },
+  {
+   "id": "s004",
+   "text": "My phone is almost out of battery."
+  },
+  {
+   "id": "s005",
+   "text": "Have you seen my keys anywhere?"
+  },
+  {
+   "id": "s006",
+   "text": "The coffee shop on the corner closes at six."
+  },
+  {
+   "id": "s007",
+   "text": "I'm going to take the dog for a walk."
+  },
+  {
+   "id": "s008",
+   "text": "Let's order pizza tonight."
+  },
+  {
+   "id": "s009",
+   "text": "She said she would call back after lunch."
+  },
+  {
+   "id": "s010",
+   "text": "It's supposed to rain all weekend."
+  },
+  {
+   "id": "s011",
+   "text": "Do you want to watch a movie later?"
+  },
+  {
+   "id": "s012",
+   "text": "I left my jacket in the car."
+  },
+  {
+   "id": "s013",
+   "text": "The train was twenty minutes late this morning."
+  },
+  {
+   "id": "s014",
+   "text": "Can you send me the address again?"
+  },
+  {
+   "id": "s015",
+   "text": "I haven't had breakfast yet."
+  },
+  {
+   "id": "s016",
+   "text": "We need to buy milk, eggs and bread."
+  },
+  {
+   "id": "s017",
+   "text": "That was the best soup I've ever had."
+  },
+  {
+   "id": "s018",
+   "text": "Please turn the music down a little."
+  },
+  {
+   "id": "s019",
+   "text": "How was your trip to the mountains?"
+  },
+  {
+   "id": "s020",
+   "text": "I'll be there in about ten minutes."
+  },
+  {
+   "id": "s021",
+   "text": "The kids are already asleep upstairs."
+  },
+  {
+   "id": "s022",
+   "text": "He forgot to bring his laptop charger."
+  },
+  {
+   "id": "s023",
+   "text": "What time does the game start?"
+  },
+  {
+   "id": "s024",
+   "text": "I really need a long vacation."
+  },
+  {
+   "id": "s025",
+   "text": "Thanks for helping me move last week."
+  },
+  {
+   "id": "s026",
+   "text": "The printer on the second floor is broken again."
+  },
+  {
+   "id": "s027",
+   "text": "Could we reschedule for next Monday?"
+  },
+  {
+   "id": "s028",
+   "text": "My sister just started a new job in Chicago."
+  },
+  {
+   "id": "s029",
+   "text": "Don't forget to water the plants."
+  },
+  {
+   "id": "s030",
+   "text": "I can't find a parking spot anywhere."
+  },
+  {
+   "id": "s031",
+   "text": "This room is way too cold."
+  },
+  {
+   "id": "s032",
+   "text": "Are you coming to the party on Saturday?"
+  },
+  {
+   "id": "s033",
+   "text": "The doctor said I should get more sleep."
+  },
+  {
+   "id": "s034",
+   "text": "We ran out of paper towels."
+  },
+  {
+   "id": "s035",
+   "text": "I'm learning how to play the guitar."
+  },
+  {
+   "id": "s036",
+   "text": "Is this seat taken?"
+  },
+  {
+   "id": "s037",
+   "text": "The package should arrive tomorrow morning."
+  },
+  {
+   "id": "s038",
+   "text": "Let me know if you need anything else."
+  },
+  {
+   "id": "s039",
+   "text": "I usually go running before work."
+  },
+  {
+   "id": "s040",
+   "text": "That restaurant is always crowded on Fridays."
+  },
+  {
+   "id": "s041",
+   "text": "Can you help me carry these boxes?"
+  },
+  {
+   "id": "s042",
+   "text": "I think I left the oven on."
+  },
+  {
+   "id": "s043",
+   "text": "The new update made my computer slower."
+  },
+  {
+   "id": "s044",
+   "text": "We should plant tomatoes in the spring."
+  },
+  {
+   "id": "s045",
+   "text": "My favorite season is definitely autumn."
+  },
+  {
+   "id": "s046",
+   "text": "Where did you park the car?"
+  },
+  {
+   "id": "s047",
+   "text": "I'm sorry, I didn't catch your name."
+  },
+  {
+   "id": "s048",
+   "text": "The library has a great collection of old maps."
+  },
+  {
+   "id": "s049",
+   "text": "It took me three hours to finish the puzzle."
+  },
+  {
+   "id": "s050",
+   "text": "Would you like some tea or coffee?"
+  },
+  {
+   "id": "s051",
+   "text": "I need to renew my passport before the trip."
+  },
+  {
+   "id": "s052",
+   "text": "The baby finally smiled at me today."
+  },
+  {
+   "id": "s053",
+   "text": "Our flight leaves at seven in the morning."
+  },
+  {
+   "id": "s054",
+   "text": "I'm not sure that's a good idea."
+  },
+  {
+   "id": "s055",
+   "text": "He plays basketball every Tuesday night."
+  },
+  {
+   "id": "s056",
+   "text": "Could you speak a little more slowly?"
+  },
+  {
+   "id": "s057",
+   "text": "The museum is free on the first Sunday of the month."
+  },
+  {
+   "id": "s058",
+   "text": "I just finished reading a really long book."
+  },
+  {
+   "id": "s059",
+   "text": "Please close the window before you leave."
+  },
+  {
+   "id": "s060",
+   "text": "We painted the kitchen a light shade of green."
+  },
+  {
+   "id": "s061",
+   "text": "My grandmother makes the best apple pie."
+  },
+  {
+   "id": "s062",
+   "text": "Turn left at the next traffic light."
+  },
+  {
+   "id": "s063",
+   "text": "I can't believe how fast this year went by."
+  },
+  {
+   "id": "s064",
+   "text": "The bus stop is right across the street."
+  },
+  {
+   "id": "s065",
+   "text": "She's been working from home since March."
+  },
+  {
+   "id": "s066",
+   "text": "Do we have enough chairs for everyone?"
+  },
+  {
+   "id": "s067",
+   "text": "I'll text you when I get home."
+  },
+  {
+   "id": "s068",
+   "text": "The cat knocked a glass off the table."
+  },
+  {
+   "id": "s069",
+   "text": "Let's meet at the park near the river."
+  },
+  {
+   "id": "s070",
+   "text": "I need to get my hair cut soon."
+  },
+  {
+   "id": "s071",
+   "text": "Nobody told me the store was closed."
+  },
+  {
+   "id": "s072",
+   "text": "How much does a ticket cost?"
+  },
+  {
+   "id": "s073",
+   "text": "I've been feeling a little tired lately."
+  },
+  {
+   "id": "s074",
+   "text": "The soup needs a bit more pepper."
+  },
+  {
+   "id": "s075",
+   "text": "We watched the sunset from the beach."
+  },
+  {
+   "id": "s076",
+   "text": "My brother is visiting us next month."
+  },
+  {
+   "id": "s077",
+   "text": "Could you check if the door is locked?"
+  },
+  {
+   "id": "s078",
+   "text": "I spilled coffee on my favorite shirt."
+  },
+  {
+   "id": "s079",
+   "text": "The lecture went on for almost two hours."
+  },
+  {
+   "id": "s080",
+   "text": "Let's take a short break and stretch."
+  },
+  {
+   "id": "s081",
+   "text": "I'm happy to hear that everything worked out."
+  },
+  {
+   "id": "s082",
+   "text": "Which way is the train station?"
+  },
+  {
+   "id": "s083",
+   "text": "The garden looks beautiful after the rain."
+  },
+  {
+   "id": "s084",
+   "text": "I have a dentist appointment on Wednesday."
+  },
+  {
+   "id": "s085",
+   "text": "Can I borrow your umbrella?"
+  },
+  {
+   "id": "s086",
+   "text": "The neighbors are having a barbecue tonight."
+  },
+  {
+   "id": "s087",
+   "text": "I didn't realize it was so late."
+  },
+  {
+   "id": "s088",
+   "text": "We should invite them over for dinner."
+  },
+  {
+   "id": "s089",
+   "text": "My knee has been hurting since the hike."
+  },
+  {
+   "id": "s090",
+   "text": "The movie was much better than I expected."
+  },
+  {
+   "id": "s091",
+   "text": "Please remember to bring your ID."
+  },
+  {
+   "id": "s092",
+   "text": "I'll pick up some groceries on the way home."
+  },
+  {
+   "id": "s093",
+   "text": "The bakery sells fresh bread every morning."
+  },
+  {
+   "id": "s094",
+   "text": "What do you want for your birthday?"
+  },
+  {
+   "id": "s095",
+   "text": "I'm going to bed early tonight."
+  },
+  {
+   "id": "s096",
+   "text": "The wifi keeps dropping in the living room."
+  },
+  {
+   "id": "s097",
+   "text": "Thank you so much for the lovely flowers."
+  },
+  {
+   "id": "s098",
+   "text": "Could you repeat the last part?"
+  },
+  {
+   "id": "s099",
+   "text": "We're almost out of gas."
+  },
+  {
+   "id": "s100",
+   "text": "It was really nice talking with you."
+  }
+ ]
+}

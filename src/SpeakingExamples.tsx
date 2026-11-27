@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { RefObject } from 'react';
 import { Check, Circle, LoaderCircle, MicOff, Trash2, X } from 'lucide-react';
-import { captureSize } from './capture';
+import { startRecording } from './recorder';
+import { useDialogFocus } from './dialog';
+import type { RecordPhase, Recording } from './recorder';
 
 const EXAMPLES = [
   { label: 'quiet_still', title: 'Quiet, relaxed', prompt: 'Relax your mouth and stay quiet. Blink and breathe normally; there is no need to freeze.' },
@@ -11,7 +13,6 @@ const EXAMPLES = [
 ] as const;
 type Label = typeof EXAMPLES[number]['label'];
 type Example = { id: string; label: Label; take: 1 | 2; frames: number; duration_seconds: number };
-type Phase = 'idle' | 'connecting' | 'countdown' | 'recording' | 'saving';
 type Props = { videoRef: RefObject<HTMLVideoElement | null>; cameraOn: boolean; onClose: () => void };
 
 function isExample(value: unknown): value is Example {
@@ -26,7 +27,7 @@ export default function SpeakingExamples({ videoRef, cameraOn, onClose }: Props)
   const [loading, setLoading] = useState(true);
   const [label, setLabel] = useState<Label>('quiet_still');
   const [take, setTake] = useState<1 | 2>(1);
-  const [phase, setPhase] = useState<Phase>('idle');
+  const [phase, setPhase] = useState<RecordPhase>('idle');
   const [seconds, setSeconds] = useState(3);
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState('');
@@ -35,7 +36,7 @@ export default function SpeakingExamples({ videoRef, cameraOn, onClose }: Props)
   const previewRef = useRef<HTMLVideoElement>(null);
   const dialogRef = useRef<HTMLElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
-  const runRef = useRef<{ cancel: () => void; isSaving: () => boolean } | null>(null);
+  const runRef = useRef<Recording | null>(null);
   const active = phase !== 'idle';
   const selected = EXAMPLES.find((example) => example.label === label)!;
   const matching = samples.filter((sample) => sample.label === label && sample.take === take);
@@ -43,6 +44,7 @@ export default function SpeakingExamples({ videoRef, cameraOn, onClose }: Props)
 
   const cancelRecording = useCallback(() => {
     runRef.current?.cancel();
+    runRef.current = null;
     setPhase('idle');
     setNotice('Recording canceled. The unfinished example was discarded.');
   }, []);
@@ -76,144 +78,24 @@ export default function SpeakingExamples({ videoRef, cameraOn, onClose }: Props)
     return () => { if (preview) preview.srcObject = null; };
   }, [cameraOn, videoRef, cancelRecording]);
 
-  useEffect(() => {
-    const previous = document.activeElement as HTMLElement | null;
-    dialogRef.current?.focus();
-    const listener = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && closeRef.current && !closeRef.current.disabled) onClose();
-      if (event.key !== 'Tab') return;
-      const controls = dialogRef.current?.querySelectorAll<HTMLElement>('button:not(:disabled), [tabindex="0"]');
-      const first = controls?.[0];
-      const last = controls?.[controls.length - 1];
-      if (!first || !last) { event.preventDefault(); dialogRef.current?.focus(); return; }
-      // Recording can disable the button that just had focus. Tab must stay in
-      // this dialog even while every control except Cancel is unavailable.
-      if (!Array.from(controls ?? []).includes(document.activeElement as HTMLElement)) {
-        event.preventDefault(); (event.shiftKey ? last : first).focus(); return;
-      }
-      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
-      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
-    };
-    document.addEventListener('keydown', listener);
-    return () => { document.removeEventListener('keydown', listener); previous?.focus(); };
-  }, [onClose]);
+  useDialogFocus(dialogRef, closeRef, onClose);
 
   const record = () => {
     const video = videoRef.current;
     if (runRef.current || !cameraOn || !video || video.readyState < 2 || matching.length || loading || deleting) return;
-    const canvas = document.createElement('canvas');
-    const context = canvas.getContext('2d', { alpha: false });
-    if (!context) { setError('Camera recording is unavailable in this browser.'); return; }
-    setError(''); setNotice(''); setPhase('connecting'); setProgress(0);
-    const socket = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/api/examples`);
-    const timers = new Set<ReturnType<typeof setTimeout>>();
-    let canceled = false;
-    let capturing = false;
-    let encoding = false;
-    let finishing = false;
-    let stopSent = false;
-    let ready = false;
-    let frameHandle = 0;
-    let nextCapture = 0;
-    let lastMediaTime = -1;
-    const schedule = (callback: () => void, delay: number) => {
-      const handle = setTimeout(() => { timers.delete(handle); if (!canceled) callback(); }, delay);
-      timers.add(handle);
-      return handle;
-    };
-    const cancelFrame = () => {
-      if (video.cancelVideoFrameCallback) video.cancelVideoFrameCallback(frameHandle);
-      else cancelAnimationFrame(frameHandle);
-    };
-    const cleanup = () => {
-      canceled = true; capturing = false; cancelFrame();
-      timers.forEach(clearTimeout); timers.clear();
-      socket.onopen = socket.onmessage = socket.onerror = socket.onclose = null;
-      socket.close();
-      runRef.current = null;
-    };
-    const fail = (detail: string) => {
-      if (canceled) return;
-      cleanup(); setPhase('idle'); setError(detail);
-    };
-    const sendStop = () => {
-      if (canceled || encoding || stopSent) return;
-      if (socket.readyState !== WebSocket.OPEN) { fail('The recording connection was lost. Please try again.'); return; }
-      stopSent = true;
-      socket.send(JSON.stringify({ type: 'stop' }));
-      schedule(() => fail('Saving took too long. Close this panel and reopen it to check whether the example was saved.'), 20000);
-    };
-    const finish = () => {
-      capturing = false; finishing = true; cancelFrame(); setPhase('saving'); setSeconds(0); setProgress(1);
-      // A JPEG already being encoded must precede the stop message on the socket.
-      sendStop();
-    };
-    const frame = (now: number) => {
-      if (canceled || !capturing) return;
-      frameHandle = video.requestVideoFrameCallback ? video.requestVideoFrameCallback(frame) : requestAnimationFrame(frame);
-      if (video.readyState < 2 || now < nextCapture || video.currentTime === lastMediaTime || encoding) return;
-      lastMediaTime = video.currentTime;
-      nextCapture = nextCapture ? nextCapture + 40 : now + 40;
-      if (now - nextCapture > 40) nextCapture = now + 40;
-      if (socket.readyState !== WebSocket.OPEN) { fail('The recording connection was lost. Please try again.'); return; }
-      if (socket.bufferedAmount > 2 * 1024 * 1024) { fail('The connection could not keep up. Please try recording again.'); return; }
-      const { width, height } = captureSize(video.videoWidth, video.videoHeight);
-      if (!width || !height) return;
-      if (canvas.width !== width || canvas.height !== height) { canvas.width = width; canvas.height = height; }
-      context.drawImage(video, 0, 0, width, height);
-      encoding = true;
-      canvas.toBlob(async (blob) => {
-        try {
-          if (canceled) return;
-          if (!blob) { fail('Could not capture a camera frame. Please try again.'); return; }
-          const jpeg = await blob.arrayBuffer();
-          if (canceled) return;
-          if (socket.readyState !== WebSocket.OPEN) { fail('The recording connection was lost. Please try again.'); return; }
-          const packet = new Uint8Array(8 + jpeg.byteLength);
-          new DataView(packet.buffer).setFloat64(0, now, true);
-          packet.set(new Uint8Array(jpeg), 8);
-          socket.send(packet);
-        } catch { fail('Could not capture the camera frames. Please try again.'); }
-        finally { encoding = false; if (finishing) sendStop(); }
-      }, 'image/jpeg', 0.92);
-    };
-    const begin = () => {
-      const began = performance.now();
-      capturing = true; setPhase('recording'); setSeconds(8);
-      const tick = () => {
-        const elapsed = performance.now() - began;
-        if (!capturing) return;
-        setSeconds(Math.max(0, Math.ceil((8000 - elapsed) / 1000)));
-        setProgress(Math.min(1, elapsed / 8000));
-        schedule(tick, 100);
-      };
-      tick();
-      schedule(finish, 8000);
-      frameHandle = video.requestVideoFrameCallback ? video.requestVideoFrameCallback(frame) : requestAnimationFrame(frame);
-    };
-    const countdown = (remaining: number) => {
-      if (remaining === 0) { begin(); return; }
-      setPhase('countdown'); setSeconds(remaining);
-      schedule(() => countdown(remaining - 1), 1000);
-    };
-    runRef.current = { cancel: cleanup, isSaving: () => stopSent };
-    const connectionTimer = schedule(() => fail('Could not start recording. Check the connection and try again.'), 15000);
-    socket.onopen = () => socket.send(JSON.stringify({ type: 'start', label, take }));
-    socket.onmessage = (event) => {
-      let message: unknown;
-      try { message = JSON.parse(event.data); } catch { fail('The recording server returned an invalid response.'); return; }
-      if (!message || typeof message !== 'object') return;
-      const result = message as Record<string, unknown>;
-      if (result.type === 'ready' && !ready) {
-        ready = true; clearTimeout(connectionTimer); timers.delete(connectionTimer); countdown(3);
-      } else if (result.type === 'saved' && isExample(message)) {
-        if (message.label !== label || message.take !== take) { fail('The recording label did not match. Close this panel and check the saved examples.'); return; }
-        cleanup(); setPhase('idle'); setSamples((current) => [...current.filter((sample) => sample.id !== message.id), message]);
+    setError(''); setNotice(''); setProgress(0);
+    runRef.current = startRecording({
+      video, path: '/api/examples', start: { label, take }, maxMs: 8000,
+      onPhase: (next, remaining) => { setPhase(next); setSeconds(remaining); if (next === 'saving') setProgress(1); },
+      onElapsed: (elapsed) => { setSeconds(Math.max(0, Math.ceil((8000 - elapsed) / 1000))); setProgress(elapsed / 8000); },
+      onSaved: (message) => {
+        runRef.current = null; setPhase('idle');
+        if (!isExample(message) || message.label !== label || message.take !== take) { setError('The recording label did not match. Close this panel and check the saved examples.'); return; }
+        setSamples((current) => [...current.filter((sample) => sample.id !== message.id), message]);
         setNotice(`${selected.title}, take ${take}, saved on this machine. Select the next example when you are ready.`);
-      } else if (result.type === 'error') fail(typeof result.detail === 'string' ? result.detail : 'Could not save the recording.');
-    };
-    socket.onerror = () => fail('Could not connect to the recording server. Please try again.');
-    socket.onclose = () => fail('The recording connection closed before saving was confirmed. Reopen this panel to check saved examples.');
+      },
+      onError: (detail) => { runRef.current = null; setPhase('idle'); setError(detail); },
+    });
   };
 
   const deleteSample = async (sample: Example) => {
