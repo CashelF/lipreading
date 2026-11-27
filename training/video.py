@@ -59,6 +59,17 @@ def encode_gray(frames: np.ndarray, fps: int = 25, crf: int = 20) -> bytes:
     return output.getvalue()
 
 
+def decode_audio(data: bytes) -> np.ndarray:
+    """A clip's soundtrack as mono 16 kHz int16 samples. ``data`` is an audio file or a video file that holds one."""
+    chunks = []
+    with av.open(io.BytesIO(data)) as container:
+        resampler = av.AudioResampler(format='s16', layout='mono', rate=16000)
+        for frame in container.decode(audio=0):
+            chunks += [resampled.to_ndarray()[0] for resampled in resampler.resample(frame)]
+        chunks += [resampled.to_ndarray()[0] for resampled in resampler.resample(None)]
+    return np.concatenate(chunks)
+
+
 def transcode_audio(data: bytes, bitrate: int = 16000) -> bytes | None:
     """Mono 16 kHz Opus copy of a clip's soundtrack, for later Whisper-feature targets."""
     output = io.BytesIO()

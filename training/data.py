@@ -8,22 +8,25 @@ import torch
 from torch.utils.data import IterableDataset, get_worker_info
 
 from training.shards import read_samples
+from training.teacher import SAMPLES_PER_FRAME
 from training.text import Vocabulary
-from training.video import decode_gray, frame_count
+from training.video import decode_audio, decode_gray, frame_count
 
 MEAN, STD = 0.421, 0.165  # Same grayscale statistics as the live preprocessor.
 
 
 class ClipBatches(IterableDataset):
-    """Yields ready batches: uint8 video (B, T, 96, 96), frame counts, padded token ids, token counts."""
+    """Yields ready batches: uint8 video (B, T, 96, 96), frame counts, padded token ids, token counts,
+    then int16 audio (B, 640 T) with ``with_audio`` and the transcripts with ``with_text``."""
 
     def __init__(self, shards, vocabulary_path, *, frames_per_batch: int, max_frames: int = 400, min_frames: int = 12,
                  shuffle: bool = True, seed: int = 0, pool: int = 600, interleave: int = 4,
-                 with_text: bool = False):
+                 with_audio: bool = False, with_text: bool = False):
         self.shards = [str(path) for path in shards]
         self.vocabulary_path = str(vocabulary_path)
         self.frames_per_batch, self.max_frames, self.min_frames = frames_per_batch, max_frames, min_frames
-        self.shuffle, self.seed, self.pool, self.with_text = shuffle, seed, pool, with_text
+        self.shuffle, self.seed, self.pool = shuffle, seed, pool
+        self.with_audio, self.with_text = with_audio, with_text
         self.interleave = interleave if shuffle else 1
 
     def _samples(self, shards, vocabulary):
@@ -52,7 +55,14 @@ class ClipBatches(IterableDataset):
                     continue
                 if video.shape[1:] != (96, 96):
                     continue
-                yield video, tokens, sample['text']
+                audio = None
+                if self.with_audio:
+                    try:
+                        audio = decode_audio(sample.get('audio') or sample['video'])
+                    except Exception:
+                        continue  # No soundtrack: nothing to predict.
+                    audio = np.pad(audio, (0, max(0, len(video) * SAMPLES_PER_FRAME - len(audio))))[:len(video) * SAMPLES_PER_FRAME]
+                yield video, tokens, sample['text'], audio
 
     def _batches(self, items):
         items.sort(key=lambda item: len(item[0]))
@@ -68,15 +78,19 @@ class ClipBatches(IterableDataset):
             yield batch
 
     def _collate(self, batch):
-        frames = torch.tensor([len(video) for video, _, _ in batch])
+        frames = torch.tensor([len(item[0]) for item in batch])
         video = torch.zeros(len(batch), int(frames.max()), 96, 96, dtype=torch.uint8)
-        token_counts = torch.tensor([len(tokens) for _, tokens, _ in batch])
+        token_counts = torch.tensor([len(item[1]) for item in batch])
         tokens = torch.zeros(len(batch), int(token_counts.max()), dtype=torch.long)
-        for row, (clip, ids, _) in enumerate(batch):
+        audio = torch.zeros(len(batch), video.shape[1] * SAMPLES_PER_FRAME if self.with_audio else 0, dtype=torch.int16)
+        for row, (clip, ids, _, sound) in enumerate(batch):
             video[row, :len(clip)] = torch.from_numpy(clip)
             tokens[row, :len(ids)] = torch.tensor(ids)
+            if self.with_audio:
+                audio[row, :len(sound)] = torch.from_numpy(sound)
         result = (video, frames, tokens, token_counts)
-        return result + ([text for _, _, text in batch],) if self.with_text else result
+        result += (audio,) if self.with_audio else ()
+        return result + ([item[2] for item in batch],) if self.with_text else result
 
     def __iter__(self):
         info = get_worker_info()
@@ -119,4 +133,3 @@ def prepare(video: torch.Tensor, frames: torch.Tensor, *, train: bool) -> torch.
         x = x.masked_fill(hidden.to(video.device)[:, :, None, None], 0)
     padding = torch.arange(length, device=video.device)[None] >= frames.to(video.device)[:, None]
     return x.masked_fill(padding[:, :, None, None], 0)
-
