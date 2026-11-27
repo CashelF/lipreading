@@ -42,6 +42,15 @@ systemctl --user stop lipreading-pilot-train    # saves a checkpoint; start agai
 - **Files in the run folder:** `train.jsonl` (numbers only), `last.pt` (written every 2,000 steps and on stop; the run resumes from it) and `best.pt` (lowest dev WER).
 - The first shard of each source is the dev set and is excluded from training. Their speakers can also appear in training video, so dev WER is for tracking progress, not a held-out result.
 
+## Watch
+
+```bash
+systemd-run --user --unit=lipreading-dashboard --property=WorkingDirectory="$PWD" \
+  python3 training/dashboard.py --bind "$(tailscale ip -4)" --port 8470
+```
+
+Open `http://<machine's Tailscale name>:8470` from any device on the tailnet. The page charts dev WER, both losses, speed and learning rate against hours of video seen, for every run under `data/train/runs/`, and refreshes every 30 seconds. It serves only the numbers in each `train.jsonl`. Move a finished experiment's folder out of `runs/` to drop it from the page.
+
 ## Evaluate
 
 ```bash
