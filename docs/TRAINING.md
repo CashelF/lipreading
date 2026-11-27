@@ -35,7 +35,7 @@ tail -f data/train/runs/pilot/train.jsonl
 systemctl --user stop lipreading-pilot-train    # saves a checkpoint; start again to resume
 ```
 
-`training/run_pilot.sh` waits for the download and conversion units, builds a 1,000-piece SentencePiece vocabulary once, then runs `training/train.py`. Check `nvidia-smi` first: the run holds about 26 GiB of GPU memory, and the app needs 28 GiB free to load.
+`training/run_pilot.sh` waits for the download and conversion units, builds a 1,000-piece SentencePiece vocabulary once, then runs `training/train.py`. The run is capped at 38 GiB of GPU memory (`--memory-gib`) so other jobs on the card keep theirs; a batch that would exceed the cap is skipped and counted in `skipped`. Check `nvidia-smi` first: the app needs 28 GiB free to load.
 
 - **Model:** 3D-conv stem and ResNet18 per frame, a 12-layer Conformer (width 256), a CTC head and a 6-layer attention decoder. Loss is 0.1 CTC + 0.9 attention with label smoothing.
 - **Recipe:** AdamW, peak learning rate 7e-4, warm-up then cosine decay measured in hours of video seen, 9,600 frames per batch, bf16 autocast, 20 passes. Augmentation is random 88×88 crop, horizontal flip and time masking. The first pass uses only clips of 4 seconds or less, because lipreading from scratch needs short clips to learn alignment.
