@@ -32,12 +32,12 @@ See [Is this machine enough?](#is-this-machine-enough) for run lengths and renta
 
 ## Is this machine enough?
 
-For the pilot and all data preparation, yes. For the full-size model, no.
+For the pilot and all data preparation, yes. A full-size run fits too, but takes about a month.
 
-- **Measured training speed:** about 1,150 video-hours per GPU-hour with the GPU to itself, on the pilot's first pass (clips of 4 seconds or less; later passes use longer clips and may be slower). It fell to about 150 while another job held the same GPU at 95%. The live figure is `video_hours_per_hour` in `data/train/runs/pilot/train.jsonl`. The run lengths below assume 300–600 and are therefore conservative.
-- **Pilot** (2,500 hours × 20 passes = 50,000 video-hours): 3.5–7 days on this GPU alone, about two weeks if the GPU stays shared.
-- **One full-size run** (10,000 hours × about 30 passes, plus a Whisper-feature pretraining stage of similar size, about 600,000 video-hours): 1,000–2,000 GPU-hours. That is 1.5–3 months on this machine, or about a week on 8 rented GPUs of the same class at roughly $2.5–5k.
-- **Whole programme** (three full-size runs and smaller ablations): 4,000–6,000 GPU-hours, about $9–15k rented at $2.50 per GPU-hour. The earlier $3–6k figure left out the pretraining stage and assumed the synthetic speed.
+- **Measured training speed (2026-11-27):** 730–1,180 video-hours per GPU-hour, about 900 on average, on the pilot's second pass (clips up to 16 seconds, 9,600 frames per batch, 27 GiB of GPU memory, GPU to itself). It fell to about 150 while another job held the same GPU at 95%. The live figure is `video_hours_per_hour` in `data/train/runs/pilot/train.jsonl`.
+- **Pilot** (2,500 hours × 20 passes, about 48,000 video-hours): about 2.5 days on this GPU alone.
+- **One full-size run** (10,000 hours × about 30 passes, plus a Whisper-feature pretraining stage of similar size, about 600,000 video-hours): about 670 GPU-hours. That is about 4 weeks on this machine, or 3.5 days on 8 rented GPUs of the same class for about $1,700 at $2.50 per GPU-hour.
+- **Whole programme** (three full-size runs and smaller ablations): about 2,700 GPU-hours. That is 4 months on this machine alone, or about $7k rented. The pretraining stage has not been run, so its cost is the least certain part.
 
 Rent GPUs only if the pilot shows a small model is worth scaling.
 
