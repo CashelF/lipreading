@@ -16,7 +16,7 @@ PAGE = Path(__file__).with_suffix('.html')
 
 
 def load(runs: Path = RUNS) -> dict:
-    """Every run's curves: steps as [hours, ctc, attention, lr, speed, audio], passes as [pass, hours, wer, loss]."""
+    """Every run's curves: steps as [hours, ctc, attention, lr, speed, teacher], passes as [pass, hours, wer, loss]."""
     result = []
     for log in sorted(runs.glob('*/train.jsonl')):
         steps, passes, start, last = [], [], {}, {}
@@ -29,7 +29,7 @@ def load(runs: Path = RUNS) -> dict:
             event = row.get('event')
             if event is None:
                 steps.append([row['hours_seen'], row['ctc'], row['attention'], row['lr'], row['video_hours_per_hour'],
-                              row.get('audio')])  # Only runs that also predict the clip's sound log it.
+                              row['teacher']])
             elif event == 'epoch':
                 passes.append([row['epoch'] + 1, row['hours_seen'], row['dev_wer'], row['dev_loss']])
             elif event == 'start':

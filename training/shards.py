@@ -12,11 +12,10 @@ from typing import Iterator
 
 VIDEO_EXT = ('mp4', 'video')
 TEXT_EXT = ('txt', 'label')
-AUDIO_EXT = ('ogg',)  # Upstream shards keep the soundtrack inside the video file.
 
 
 def read_samples(path: str | Path) -> Iterator[dict]:
-    """Yield ``{'key', 'video', 'text'}``, plus ``'audio'`` when stored apart, for each complete sample in file order."""
+    """Yield ``{'key', 'video', 'text'}`` for each complete sample, in file order."""
     current, key = {}, None
     with tarfile.open(path, 'r|') as tar:
         for member in tar:
@@ -31,8 +30,6 @@ def read_samples(path: str | Path) -> Iterator[dict]:
                 current['video'] = tar.extractfile(member).read()
             elif ext in TEXT_EXT:
                 current['text'] = tar.extractfile(member).read().decode('utf-8', 'replace').strip()
-            elif ext in AUDIO_EXT:
-                current['audio'] = tar.extractfile(member).read()
         if _complete(current):
             yield current
 

@@ -1,4 +1,4 @@
-"""Lip clips to text: 3D-conv + ResNet18 front end, Conformer encoder, CTC and attention heads."""
+"""Lip clips to text: FLARE's ConvNeXt lip front end, a small Conformer, CTC and attention heads."""
 from __future__ import annotations
 
 import math
@@ -8,46 +8,70 @@ from torch import nn
 import torch.nn.functional as F
 from torchaudio.models import Conformer
 
-from training.teacher import CODES
+TEACHER_DIM = 768  # Width of FLARE's encoder output.
 
 
-class BasicBlock(nn.Module):
-    def __init__(self, inputs: int, outputs: int, stride: int):
+class ChannelNorm(nn.Module):
+    """Layer normalization over the channel axis (axis 1) of an image or video tensor."""
+
+    def __init__(self, channels: int, eps: float = 1e-6):
         super().__init__()
-        self.conv1 = nn.Conv2d(inputs, outputs, 3, stride, 1, bias=False)
-        self.bn1 = nn.BatchNorm2d(outputs)
-        self.conv2 = nn.Conv2d(outputs, outputs, 3, 1, 1, bias=False)
-        self.bn2 = nn.BatchNorm2d(outputs)
-        self.shortcut = None
-        if stride != 1 or inputs != outputs:
-            self.shortcut = nn.Sequential(nn.Conv2d(inputs, outputs, 1, stride, bias=False), nn.BatchNorm2d(outputs))
+        self.weight, self.bias, self.eps = nn.Parameter(torch.ones(channels)), nn.Parameter(torch.zeros(channels)), eps
 
     def forward(self, x):
-        y = F.silu(self.bn1(self.conv1(x)))
-        y = self.bn2(self.conv2(y))
-        return F.silu(y + (x if self.shortcut is None else self.shortcut(x)))
+        x = x - x.mean(1, keepdim=True)
+        x = x / torch.sqrt(x.pow(2).mean(1, keepdim=True) + self.eps)
+        shape = (1, -1) + (1,) * (x.dim() - 2)
+        return self.weight.view(shape) * x + self.bias.view(shape)
+
+
+class Block(nn.Module):
+    """ConvNeXt block: depthwise convolution, then a pointwise expansion and projection."""
+
+    def __init__(self, dim: int, kernel: int):
+        super().__init__()
+        self.dwconv = nn.Conv2d(dim, dim, kernel, padding=kernel // 2, groups=dim)
+        self.norm = nn.LayerNorm(dim, eps=1e-6)
+        self.pwconv1, self.pwconv2 = nn.Linear(dim, 4 * dim), nn.Linear(4 * dim, dim)
+        self.gamma = nn.Parameter(1e-6 * torch.ones(dim))
+
+    def forward(self, x):
+        y = self.norm(self.dwconv(x).permute(0, 2, 3, 1))
+        return x + (self.gamma * self.pwconv2(F.gelu(self.pwconv1(y)))).permute(0, 3, 1, 2)
+
+
+class Trunk(nn.Module):
+    def __init__(self, dims=(96, 192, 384, 768), kernels=(7, 7, 5, 3)):
+        super().__init__()
+        self.downsample_layers = nn.ModuleList([nn.Identity()] + [
+            nn.Sequential(ChannelNorm(dims[i]), nn.Conv2d(dims[i], dims[i + 1], 2, 2, padding=1 if i == 1 else 0))
+            for i in range(3)])
+        self.stages = nn.ModuleList(nn.Sequential(Block(dim, kernel), Block(dim, kernel)) for dim, kernel in zip(dims, kernels))
+        self.norm = nn.LayerNorm(dims[-1], eps=1e-6)
+
+    def forward(self, x):
+        for downsample, stage in zip(self.downsample_layers, self.stages):
+            x = stage(downsample(x))
+        return self.norm(x.mean((-2, -1)))
 
 
 class Frontend(nn.Module):
-    """One feature vector per video frame; the only temporal context is the 5-frame stem."""
+    """One feature vector per video frame; the only temporal context is the 5-frame stem.
 
-    def __init__(self, width: int = 64):
+    The layout and parameter names are those of FLARE's lip front end (``ConvEncoderT`` in its
+    ``convnext.py``: a 3D patch stem and a small ConvNeXt), so its trained weights load as they are.
+    """
+    dim = 768
+
+    def __init__(self):
         super().__init__()
-        self.stem = nn.Sequential(
-            nn.Conv3d(1, width, (5, 7, 7), (1, 2, 2), (2, 3, 3), bias=False), nn.BatchNorm3d(width), nn.SiLU(),
-            nn.MaxPool3d((1, 3, 3), (1, 2, 2), (0, 1, 1)))
-        layers, inputs = [], width
-        for index, outputs in enumerate((width, 2 * width, 4 * width, 8 * width)):
-            layers += [BasicBlock(inputs, outputs, 1 if index == 0 else 2), BasicBlock(outputs, outputs, 1)]
-            inputs = outputs
-        self.trunk = nn.Sequential(*layers)
-        self.dim = inputs
+        self.frontend3D = nn.Sequential(nn.Conv3d(1, 96, (5, 4, 4), (1, 4, 4), (2, 0, 0), bias=False), ChannelNorm(96))
+        self.trunk = Trunk()
 
     def forward(self, video):  # (B, T, H, W)
         batch, frames = video.shape[:2]
-        y = self.stem(video.unsqueeze(1)).transpose(1, 2).flatten(0, 1)  # (B*T, C, h, w)
-        y = self.trunk(y.contiguous(memory_format=torch.channels_last))
-        return y.mean((2, 3)).view(batch, frames, self.dim)
+        y = self.frontend3D(video.unsqueeze(1)).transpose(1, 2).flatten(0, 1)  # (B*T, C, h, w)
+        return self.trunk(y).view(batch, frames, self.dim)
 
 
 def positions(length: int, dim: int, device) -> torch.Tensor:
@@ -59,27 +83,52 @@ def positions(length: int, dim: int, device) -> torch.Tensor:
 
 
 class LipReader(nn.Module):
-    def __init__(self, vocab_size: int, *, width: int = 64, dim: int = 256, layers: int = 12, heads: int = 4,
+    """FLARE's lip front end (kept as it is), then a small Conformer, a CTC head and an attention decoder.
+
+    Training reads the front end's output from disk (``extract_features.py``), so every method below
+    takes those features. On video, call ``front`` first.
+    """
+
+    def __init__(self, vocab_size: int, *, dim: int = 256, layers: int = 12, heads: int = 4,
                  decoder_layers: int = 6, dropout: float = 0.1):
         super().__init__()
         self.vocab_size, self.dim = vocab_size, dim
         self.sos_eos = vocab_size - 1
-        self.frontend = Frontend(width)
-        self.project = nn.Linear(self.frontend.dim, dim)
+        self.frontend = Frontend().requires_grad_(False)
+        self.project = nn.Sequential(nn.Linear(Frontend.dim, dim), nn.LayerNorm(dim))
         self.encoder = Conformer(dim, heads, 4 * dim, layers, 31, dropout=dropout)
         self.ctc = nn.Linear(dim, vocab_size)
-        self.audio = nn.Linear(dim, 2 * CODES)  # Training only: the teacher's two codes for each frame.
+        self.teacher = nn.Linear(dim, TEACHER_DIM)  # Training only: FLARE's encoder output for each frame.
         self.embed = nn.Embedding(vocab_size, dim)
         layer = nn.TransformerDecoderLayer(dim, heads, 4 * dim, dropout, batch_first=True, norm_first=True)
         self.decoder = nn.TransformerDecoder(layer, decoder_layers, norm=nn.LayerNorm(dim))
         self.output = nn.Linear(dim, vocab_size)
 
-    def encode(self, video, lengths):
-        """video: normalized float (B, T, H, W). Returns encoder states and a padding mask."""
-        video = video[:, :int(lengths.max())]  # The encoder masks by the longest clip, not the tensor width.
-        states, lengths = self.encoder(self.project(self.frontend(video)), lengths)
-        padding = torch.arange(states.shape[1], device=states.device)[None] >= lengths[:, None]
-        return states, lengths, padding
+    @torch.no_grad()
+    def front(self, video):
+        """Normalized video (B, T, 88, 88) to features (B, T, 768), standardized per frame as they are on disk."""
+        return F.layer_norm(self.frontend(video).float(), (Frontend.dim,))
+
+    def encode(self, features, lengths):
+        """features: (B, T, 768). Returns encoder states, their lengths and a padding mask."""
+        features = features[:, :int(lengths.max())]
+        padding = torch.arange(features.shape[1], device=features.device)[None] >= lengths[:, None]
+        x = self.project(features).transpose(0, 1)  # (T, B, D)
+        for layer in self.encoder.conformer_layers:
+            # torchaudio's ConformerLayer.forward, with one addition: padded frames are zeroed just before
+            # the depthwise convolution, as its own edge padding would be. Without that they leak into the
+            # real frames beside them, and a clip batched with longer clips is encoded differently from
+            # the same clip alone.
+            x = layer.ffn1(x) * 0.5 + x
+            attended, _ = layer.self_attn(*[layer.self_attn_layer_norm(x)] * 3, key_padding_mask=padding, need_weights=False)
+            x = layer.self_attn_dropout(attended) + x
+            pointwise, gate, *rest = layer.conv_module.sequential
+            y = gate(pointwise(layer.conv_module.layer_norm(x).permute(1, 2, 0)))  # (B, D, T)
+            for step in rest:
+                y = step(y.masked_fill(padding[:, None], 0)) if step is rest[0] else step(y)
+            x = y.permute(2, 0, 1) + x
+            x = layer.final_layer_norm(layer.ffn2(x) * 0.5 + x)
+        return x.transpose(0, 1), lengths, padding
 
     def decode_step(self, tokens, states, padding):
         """Next-token logits for every position of ``tokens`` (B, U)."""
@@ -89,15 +138,15 @@ class LipReader(nn.Module):
         y = self.decoder(x, states, tgt_mask=causal, memory_key_padding_mask=padding)
         return self.output(y)
 
-    def forward(self, video, lengths, targets, target_lengths, *, audio=None, audio_weight: float = 0.0,
+    def forward(self, features, lengths, targets, target_lengths, *, teacher=None, teacher_weight: float = 0.0,
                 ctc_weight: float = 0.1, smoothing: float = 0.1):
-        """targets: (B, U) padded with 0; audio: codes from ``teacher.WhisperCodes`` (B, T, 2), or None.
+        """targets: (B, U) padded with 0; teacher: FLARE's standardized encoder features (B, T, 768), or None.
 
-        Returns (loss, ctc_loss, attention_loss, audio_loss): the text losses per token, the audio loss per code.
+        Returns (loss, ctc_loss, attention_loss, teacher_loss): the text losses per token, the teacher loss per frame.
         """
-        states, lengths, padding = self.encode(video, lengths)
+        states, lengths, padding = self.encode(features, lengths)
         log_probs = self.ctc(states).float().log_softmax(-1).transpose(0, 1)
-        # Both losses are per token, so the weights mean what they say whatever the clip length.
+        # Both text losses are per token, so the weights mean what they say whatever the clip length.
         ctc = F.ctc_loss(log_probs, targets, lengths, target_lengths, blank=0, reduction='sum', zero_infinity=True)
         ctc = ctc / target_lengths.sum()
         batch, longest = targets.shape
@@ -110,21 +159,21 @@ class LipReader(nn.Module):
         logits = self.decode_step(decoder_input, states, padding).float()
         attention = F.cross_entropy(logits.flatten(0, 1), expected.flatten(), ignore_index=-100,
                                     label_smoothing=smoothing)
-        sound = ctc.new_zeros(())
-        if audio is not None:
-            # Text gives one signal per clip; the teacher's codes give two per frame, and they are
-            # what lets a model trained from scratch start telling mouth shapes apart.
-            logits = self.audio(states).float().unflatten(-1, (2, CODES))[~padding]
-            sound = F.cross_entropy(logits.flatten(0, 1), audio[:, :states.shape[1]][~padding].flatten())
-        loss = ctc_weight * ctc + (1 - ctc_weight) * attention + audio_weight * sound
-        return loss, ctc.detach(), attention.detach(), sound.detach()
+        copied = ctc.new_zeros(())
+        if teacher is not None:
+            # Text gives one signal per clip. The teacher gives a full target for every frame, computed
+            # from the same video, and that is what gets a small model reading: distance plus direction.
+            predicted, wanted = self.teacher(states).float()[~padding], teacher[:, :states.shape[1]][~padding]
+            copied = F.l1_loss(predicted, wanted) + 1 - F.cosine_similarity(predicted, wanted, dim=-1).mean()
+        loss = ctc_weight * ctc + (1 - ctc_weight) * attention + teacher_weight * copied
+        return loss, ctc.detach(), attention.detach(), copied.detach()
 
     @torch.no_grad()
-    def greedy(self, video, lengths, max_tokens: int = 120) -> list[list[int]]:
-        states, _, padding = self.encode(video, lengths)
-        batch = video.shape[0]
-        tokens = torch.full((batch, 1), self.sos_eos, dtype=torch.long, device=video.device)
-        done = torch.zeros(batch, dtype=torch.bool, device=video.device)
+    def greedy(self, features, lengths, max_tokens: int = 120) -> list[list[int]]:
+        states, _, padding = self.encode(features, lengths)
+        batch = features.shape[0]
+        tokens = torch.full((batch, 1), self.sos_eos, dtype=torch.long, device=features.device)
+        done = torch.zeros(batch, dtype=torch.bool, device=features.device)
         for _ in range(max_tokens):
             following = self.decode_step(tokens, states, padding)[:, -1].argmax(-1)
             following = following.masked_fill(done, self.sos_eos)
@@ -138,14 +187,14 @@ class LipReader(nn.Module):
         return results
 
     @torch.no_grad()
-    def beam_search(self, video, length, *, beam: int = 10, ctc_weight: float = 0.1, max_tokens: int = 120,
+    def beam_search(self, features, length, *, beam: int = 10, ctc_weight: float = 0.1, max_tokens: int = 120,
                     length_bonus: float = 0.5) -> list[int]:
         """One clip. Attention beam search, then rescoring of finished beams with the CTC head."""
-        states, lengths, padding = self.encode(video[None], length[None])
+        states, lengths, padding = self.encode(features[None], length[None])
         ctc_log_probs = self.ctc(states).float().log_softmax(-1).transpose(0, 1)
         beams, finished = [([self.sos_eos], 0.0)], []
         for _ in range(max_tokens):
-            tokens = torch.tensor([prefix for prefix, _ in beams], device=video.device)
+            tokens = torch.tensor([prefix for prefix, _ in beams], device=features.device)
             scores = self.decode_step(tokens, states.expand(len(beams), -1, -1),
                                       padding.expand(len(beams), -1))[:, -1].float().log_softmax(-1)
             best, index = scores.topk(beam, -1)
@@ -164,8 +213,8 @@ class LipReader(nn.Module):
             words = [token for token in prefix[1:] if token != self.sos_eos]
             score = total + length_bonus * len(words)
             if words and ctc_weight:
-                target = torch.tensor([words], device=video.device)
-                ctc = -F.ctc_loss(ctc_log_probs, target, lengths, torch.tensor([len(words)], device=video.device),
+                target = torch.tensor([words], device=features.device)
+                ctc = -F.ctc_loss(ctc_log_probs, target, lengths, torch.tensor([len(words)], device=features.device),
                                   blank=0, reduction='sum', zero_infinity=True)
                 score = (1 - ctc_weight) * score + ctc_weight * float(ctc)
             rescored.append((score, words))
