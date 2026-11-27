@@ -16,7 +16,7 @@ PAGE = Path(__file__).with_suffix('.html')
 
 
 def load(runs: Path = RUNS) -> dict:
-    """Every run's curves: steps as [hours, ctc, attention, lr, speed], passes as [pass, hours, wer, loss]."""
+    """Every run's curves: steps as [hours, ctc, attention, lr, speed, audio], passes as [pass, hours, wer, loss]."""
     result = []
     for log in sorted(runs.glob('*/train.jsonl')):
         steps, passes, start, last = [], [], {}, {}
@@ -28,17 +28,21 @@ def load(runs: Path = RUNS) -> dict:
             last = row
             event = row.get('event')
             if event is None:
-                steps.append([row['hours_seen'], row['ctc'], row['attention'], row['lr'], row['video_hours_per_hour']])
+                steps.append([row['hours_seen'], row['ctc'], row['attention'], row['lr'], row['video_hours_per_hour'],
+                              row.get('audio')])  # Only runs that also predict the clip's sound log it.
             elif event == 'epoch':
                 passes.append([row['epoch'] + 1, row['hours_seen'], row['dev_wer'], row['dev_loss']])
             elif event == 'start':
-                start = row
+                start = {'time': row.get('time'), **start, 'total_hours': row.get('total_hours')}
                 # A run that resumed from an older checkpoint logs those hours again.
                 steps = [step for step in steps if step[0] <= row['hours_seen']]
         age = time.time() - log.stat().st_mtime
         status = last.get('event') if last.get('event') in ('finished', 'stopped') else 'training' if age < 600 else 'silent'
         result.append({'name': log.parent.name, 'status': status, 'minutes_since_log': round(age / 60),
-                       'total_hours': start.get('total_hours'), 'steps': steps, 'passes': passes})
+                       'started': start.get('time') or 0, 'total_hours': start.get('total_hours'),
+                       'steps': steps, 'passes': passes})
+    # Oldest first, so a new run takes the next colour and the others keep theirs.
+    result.sort(key=lambda run: run['started'])
     return {'runs': result, 'read_at': time.strftime('%a %H:%M')}
 
 
