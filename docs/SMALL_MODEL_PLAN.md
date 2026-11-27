@@ -26,11 +26,22 @@ All throughput numbers below come from this machine: an RTX PRO 6000 Blackwell (
 | Training, 10M "phone" model (half-width ResNet18, 8-layer conformer, width 192) | ~720 video-hours per GPU-hour | ~14 GPU-hours per epoch |
 | Storage of crops (estimate) | — | ~0.2–0.5 TB (1.7 TB free) |
 
-A full run of about 50 epochs over 10k hours takes ~750 GPU-hours. That's about a month on the local GPU, or about 4 days on 8 rented H100s at roughly $2,250 (assuming $3/GPU-hour and at least local speed). At 3.5k hours it's ~260 GPU-hours (~$800). Real data loading will be slower than synthetic tensors.
-
-**Compute budget for the 10k-hour route: about $3–6k**, covering several full runs plus smaller ablations. Labels and crops are a small part of that. The first pilot at 1k hours fits on the local GPU at no cost.
+See [Is this machine enough?](#is-this-machine-enough) for run lengths and rental cost.
 
 **Phone compute:** the 30M model needs 16.7 GFLOPs per second of video, and the 10M model needs 4.7. Both look affordable for a recent phone GPU over WebGPU, but that hasn't been measured on a phone. A WebGPU benchmark is the first phone step.
+
+## Is this machine enough?
+
+For the pilot and all data preparation, yes. For the full-size model, no.
+
+- **Real training speed is not yet known.** Encoder-only synthetic batches ran at 670 video-hours per GPU-hour. The first real batches ran at about 150 while another job held the same GPU at 95%. Expect 300–600 alone. Read the true figure from `video_hours_per_hour` in `data/train/runs/pilot/train.jsonl`.
+- **Pilot** (2,500 hours × 20 passes = 50,000 video-hours): 3.5–7 days on this GPU alone, about two weeks if the GPU stays shared.
+- **One full-size run** (10,000 hours × about 30 passes, plus a Whisper-feature pretraining stage of similar size, about 600,000 video-hours): 1,000–2,000 GPU-hours. That is 1.5–3 months on this machine, or about a week on 8 rented GPUs of the same class at roughly $2.5–5k.
+- **Whole programme** (three full-size runs and smaller ablations): 4,000–6,000 GPU-hours, about $9–15k rented at $2.50 per GPU-hour. The earlier $3–6k figure left out the pretraining stage and assumed the synthetic speed.
+
+Rent GPUs only if the pilot shows a small model is worth scaling.
+
+**Storage.** The pilot's clips take about 110 GB once converted (AVYT 47 GB, VoxCeleb2 64 GB). At the same encoding, 10,000 hours take 350–450 GB. Never keep source video: convert each file as it downloads and delete it. The machine has a 4 TB disk; move finished shards to object storage if free space drops below about 500 GB.
 
 ## Training data
 
@@ -87,7 +98,7 @@ Train at 2.5k, 5k and 10k hours and plot the curve. Mine more data from YouTube-
 ## Phases
 
 1. **Baseline.** Score FLARE on public held-out video: WildVSR (5 hours of YouTube clips), the LRS3 test set, and speakers held out from Seamless Interaction. Webcam sentences recorded in the app ([EVALUATION.md](EVALUATION.md)) are an optional extra.
-2. **Pilot, about 2,500 hours, local, about 2 weeks.** Train the 30M model on the AVYT and VoxCeleb2 mouth clips, which need no cropping or labelling. Score it against FLARE.
+2. **Pilot, about 2,500 hours, local (started 2026-11-27).** Train a 37M model on the AVYT and VoxCeleb2 mouth clips, which need no cropping or labelling ([TRAINING.md](TRAINING.md)). Score it against FLARE.
 3. **Scale to 5k, then 10k hours.** Add Seamless Interaction, then MultiVSR. Build the crop pipeline for them. Add FLARE-style Whisper-feature pretraining.
 4. **Phone.** Use chunked streaming attention, int8 ONNX, WebGPU through ONNX Runtime Web, and MediaPipe in the browser. Measure real-time factor and battery on two phones.
 5. **Optional.** Distill FLARE's visual-encoder features, and use a small language model for rescoring.

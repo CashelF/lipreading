@@ -17,6 +17,7 @@ face-alignment==1.4.1
 einops==0.8.0
 joblib==1.4.2
 sentencepiece==0.2.0
+av==17.1.0  # training only: clip decoding (docs/TRAINING.md)
 editdistance==0.8.1
 python-speech-features==0.6
 soundfile==0.12.1
