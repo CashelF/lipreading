@@ -65,7 +65,8 @@ FLARE runs once over every clip and saves what training reads:
 ```
 
 - **Output:** one folder per clip shard, plus `encoder.pt` (FLARE's encoder weights, which `--flare-layers` starts from). For every video frame it holds FLARE's lip front-end output (`front.npy`, the small model's input) and FLARE's encoder output (`teacher.npy`, its target), each 768 values standardized per frame and stored as int8. `index.json` lists each clip's key, transcript and frame count. `frontend.pt` holds the front-end weights, which every trained checkpoint keeps.
-- **Cost:** about 1,000 times real time on this GPU (2.4 hours for the pilot's 2,400 hours of video) and 131 MB per video-hour (about 320 GB for the pilot). Finished shards are skipped on a rerun.
+- **Cost:** 131 MB per video-hour (about 320 GB for the pilot). The AVYT shards ran at about 1,000 times real time on this GPU; the VoxCeleb2 shards were far slower while the machine was short of memory. Finished shards are skipped on a rerun.
+- **Memory:** about 40 GB with the default 8 workers. Start it with a cap (`systemd-run --property=MemoryMax=60G ...`). The first full run used 16 workers holding 4,000 clips each, peaked at 125 GB beside other jobs, and the machine's out-of-memory killer took other people's processes with it.
 - **Needs** the app's model setup (`scripts/setup_model.py`): `vendor/flare_runtime` and `models/FLARE-checkpoints`. Training itself needs neither, so it can run on a machine that has only the features.
 - **No padding.** A batch holds only clips of the same length. FLARE's encoder lets padded frames leak into real ones: a clip padded beside a longer one got features only 0.55–0.97 similar to those it gets alone, which is how the app runs it.
 - FLARE's face stream is switched off (the clips are mouth crops) and skipped, which halves the cost and does not change the output.

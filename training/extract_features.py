@@ -35,7 +35,7 @@ class ShardClips(IterableDataset):
     beside a longer one gets different features than it gets alone, which is how the app runs it.
     """
 
-    def __init__(self, shards, frames_per_batch: int, max_frames: int, min_frames: int = 12, pool: int = 4000):
+    def __init__(self, shards, frames_per_batch: int, max_frames: int, min_frames: int = 12, pool: int = 1000):
         self.shards, self.frames_per_batch, self.max_frames, self.min_frames = shards, frames_per_batch, max_frames, min_frames
         self.pool = pool
 
@@ -63,7 +63,9 @@ class ShardClips(IterableDataset):
                     continue
                 if self.min_frames <= len(video) <= self.max_frames and video.shape[1:] == (96, 96):
                     clips.append((sample['key'], sample['text'], video))
-                if len(clips) >= self.pool:  # A shard can hold 20 hours of video: hand it over in large pieces.
+                # A shard can hold 20 hours of video, 16 GB decoded: hand it over in pieces. Every worker
+                # holds one piece (about 1.6 GB), so pieces times workers must fit in memory beside other jobs.
+                if len(clips) >= self.pool:
                     yield from ((number, batch) for batch in self._batches(clips))
                     clips = []
             yield from ((number, batch) for batch in self._batches(clips))
@@ -81,7 +83,8 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--frames-per-batch', type=int, default=9600)
     parser.add_argument('--max-frames', type=int, default=400)
-    parser.add_argument('--workers', type=int, default=16)
+    parser.add_argument('--workers', type=int, default=8,
+                        help='Each holds about 2 GB, and the main process about 3 GB for every shard in progress.')
     args = parser.parse_args()
     shards = [Path(shard) for pattern in args.shards for shard in sorted(glob.glob(pattern))]
     shards = [shard for shard in shards if not (args.output / shard.stem / 'index.json').exists()]

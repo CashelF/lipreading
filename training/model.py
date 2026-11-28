@@ -180,27 +180,37 @@ FLARE_DEPTH = 18
 
 
 class FlareStack(nn.Module):
-    """The first ``count`` of FLARE's 18 encoder layers, with the steps FLARE runs before them.
+    """Some of FLARE's 18 encoder layers, with the steps FLARE runs before them, starting from its weights.
 
-    The layers keep FLARE's weights and are never trained, so the output is exactly what FLARE has
-    at that depth: a prefix is a working encoder, where layers picked from the middle are not.
+    With all 18 this is FLARE's encoder and is never trained. With fewer, the layers that are left
+    are trained to give what all 18 gave. ``keep`` lists the layers kept, by their place in FLARE.
     """
 
-    def __init__(self, count: int):
+    def __init__(self, keep):
         super().__init__()
+        self.keep = sorted(keep)
+        self.whole = self.keep == list(range(FLARE_DEPTH))
         self.lip_proj = nn.Linear(TEACHER_DIM, TEACHER_DIM)
         self.mix_norm, self.mix_proj = nn.LayerNorm(3 * TEACHER_DIM), nn.Linear(3 * TEACHER_DIM, TEACHER_DIM)
-        self.layers = nn.ModuleList(FlareLayer() for _ in range(count))
-        self.requires_grad_(False)
-        self.train()  # A new module starts in training mode; this one never leaves evaluation mode.
+        self.layers = nn.ModuleList(FlareLayer() for _ in self.keep)
+        self.requires_grad_(not self.whole)
+        self.train()
 
     def load_flare(self, state: dict):
-        """state: what extract_features.py saved as encoder.pt (all 18 layers)."""
-        kept = lambda name: not name.startswith('layers.') or int(name.split('.')[1]) < len(self.layers)
-        self.load_state_dict({name: value for name, value in state.items() if kept(name)})
+        """state: weights of all 18 layers, as extract_features.py saved them in encoder.pt."""
+        chosen = {}
+        for name, value in state.items():
+            part, _, rest = name.partition('.')
+            index, _, inner = rest.partition('.')
+            if part != 'layers':
+                chosen[name] = value
+            elif int(index) in self.keep:
+                chosen[f'layers.{self.keep.index(int(index))}.{inner}'] = value
+        self.load_state_dict(chosen)
 
     def train(self, mode: bool = True):
-        return super().train(False)  # Frozen: never drop activations, whatever the model around it does.
+        # FLARE's own encoder is frozen: it never drops activations, whatever the model around it does.
+        return super().train(mode and not self.whole)
 
     def forward(self, features, padding):
         lip = self.lip_proj(features)
@@ -220,16 +230,17 @@ def positions(length: int, dim: int, device) -> torch.Tensor:
 
 
 class LipReader(nn.Module):
-    """FLARE's lip front end and the first ``flare_layers`` of its 18 encoder layers (all kept as they
-    are), then a small Conformer of ``layers`` layers, a CTC head and an attention decoder.
+    """FLARE's lip front end, some or all of FLARE's 18 encoder layers, then a small text side: a
+    Conformer of ``layers`` layers, a CTC head and an attention decoder.
 
-    ``flare_layers`` sets the size: each FLARE layer is 17M parameters. With 0 the 40M model's
-    Conformer has to learn all of FLARE's encoder; with 18 nothing of it is left to learn. Training
-    reads the front end's output from disk (``extract_features.py``), so every method below takes
-    those features. On video, call ``front`` first.
+    Trained in two stages (docs/TRAINING.md). First the text side learns to read FLARE's whole
+    encoder, which is left as it is. Then encoder layers are dropped (``keep`` lists those that
+    stay) and what is left is trained, text side included, to give what the whole encoder gave.
+    Training reads the front end's output from disk (``extract_features.py``), so every method
+    below takes those features. On video, call ``front`` first.
     """
 
-    def __init__(self, vocab_size: int, *, flare_layers: int = 0, dim: int = 256, layers: int = 12, heads: int = 4,
+    def __init__(self, vocab_size: int, *, keep=range(FLARE_DEPTH), dim: int = 256, layers: int = 12, heads: int = 4,
                  decoder_layers: int = 6, dropout: float = 0.1, resolution: int = 88):
         super().__init__()
         self.vocab_size, self.dim = vocab_size, dim
@@ -237,13 +248,10 @@ class LipReader(nn.Module):
         self.resolution = resolution
         self.sos_eos = vocab_size - 1
         self.frontend = Frontend().requires_grad_(False)
-        self.flare = FlareStack(flare_layers) if flare_layers else None
-        self.whole_flare = flare_layers == FLARE_DEPTH
-        self.project = nn.Sequential(nn.Linear(Frontend.dim, dim), nn.LayerNorm(dim))
+        self.flare = FlareStack(keep)
+        self.project = nn.Sequential(nn.Linear(TEACHER_DIM, dim), nn.LayerNorm(dim))
         self.encoder = Conformer(dim, heads, 4 * dim, layers, 31, dropout=dropout)
         self.ctc = nn.Linear(dim, vocab_size)
-        # Training only: FLARE's encoder output for each frame, unless the model holds all of FLARE's encoder.
-        self.teacher = None if self.whole_flare else nn.Linear(dim, TEACHER_DIM)
         self.embed = nn.Embedding(vocab_size, dim)
         layer = nn.TransformerDecoderLayer(dim, heads, 4 * dim, dropout, batch_first=True, norm_first=True)
         self.decoder = nn.TransformerDecoder(layer, decoder_layers, norm=nn.LayerNorm(dim))
@@ -255,16 +263,16 @@ class LipReader(nn.Module):
         return F.layer_norm(self.frontend(shrink(video, self.resolution)).float(), (Frontend.dim,))
 
     def encode(self, features, lengths, flare=None):
-        """features: (B, T, 768). Returns encoder states, their lengths and a padding mask. ``flare``
-        supplies the FLARE layers' output when it is already known: with all 18 layers it is FLARE's
-        encoder output, which training reads from disk."""
+        """features: (B, T, 768). Returns the text side's states, their lengths, a padding mask and the
+        FLARE layers' output, standardized per frame as the stored features are. ``flare`` supplies
+        that output when it is already known: training the text side on FLARE's whole encoder reads
+        it from disk instead of running 18 layers."""
         features = features[:, :int(lengths.max())]
         padding = torch.arange(features.shape[1], device=features.device)[None] >= lengths[:, None]
-        if self.flare is not None:
-            with torch.no_grad():
-                deep = self.flare(features, padding) if flare is None else flare[:, :features.shape[1]]
-            features = F.layer_norm(deep.float(), (TEACHER_DIM,))  # Standardized per frame, as the stored features are.
-        x = self.project(features).transpose(0, 1)  # (T, B, D)
+        with torch.set_grad_enabled(torch.is_grad_enabled() and not self.flare.whole):
+            deep = self.flare(features, padding) if flare is None else flare[:, :features.shape[1]]
+            deep = F.layer_norm(deep.float(), (TEACHER_DIM,))
+        x = self.project(deep).transpose(0, 1)  # (T, B, D)
         for layer in self.encoder.conformer_layers:
             # torchaudio's ConformerLayer.forward, with one addition: padded frames are zeroed just before
             # the depthwise convolution, as its own edge padding would be. Without that they leak into the
@@ -279,7 +287,7 @@ class LipReader(nn.Module):
                 y = step(y.masked_fill(padding[:, None], 0)) if step is rest[0] else step(y)
             x = y.permute(2, 0, 1) + x
             x = layer.final_layer_norm(layer.ffn2(x) * 0.5 + x)
-        return x.transpose(0, 1), lengths, padding
+        return x.transpose(0, 1), lengths, padding, deep
 
     def decode_step(self, tokens, states, padding):
         """Next-token logits for every position of ``tokens`` (B, U)."""
@@ -295,7 +303,7 @@ class LipReader(nn.Module):
 
         Returns (loss, ctc_loss, attention_loss, teacher_loss): the text losses per token, the teacher loss per frame.
         """
-        states, lengths, padding = self.encode(features, lengths, teacher if self.whole_flare else None)
+        states, lengths, padding, deep = self.encode(features, lengths, teacher if self.flare.whole else None)
         log_probs = self.ctc(states).float().log_softmax(-1).transpose(0, 1)
         # Both text losses are per token, so the weights mean what they say whatever the clip length.
         ctc = F.ctc_loss(log_probs, targets, lengths, target_lengths, blank=0, reduction='sum', zero_infinity=True)
@@ -311,17 +319,17 @@ class LipReader(nn.Module):
         attention = F.cross_entropy(logits.flatten(0, 1), expected.flatten(), ignore_index=-100,
                                     label_smoothing=smoothing)
         copied = ctc.new_zeros(())
-        if teacher is not None and not self.whole_flare:
-            # Text gives one signal per clip. The teacher gives a full target for every frame, computed
-            # from the same video, and that is what gets a small model reading: distance plus direction.
-            predicted, wanted = self.teacher(states).float()[~padding], teacher[:, :states.shape[1]][~padding]
+        if teacher is not None and not self.flare.whole:
+            # The layers that are left must give what FLARE's whole encoder gave for the same frames:
+            # distance plus direction. Text alone is one signal per clip; this is one per frame.
+            predicted, wanted = deep[~padding], teacher[:, :deep.shape[1]][~padding]
             copied = F.l1_loss(predicted, wanted) + 1 - F.cosine_similarity(predicted, wanted, dim=-1).mean()
         loss = ctc_weight * ctc + (1 - ctc_weight) * attention + teacher_weight * copied
         return loss, ctc.detach(), attention.detach(), copied.detach()
 
     @torch.no_grad()
     def greedy(self, features, lengths, max_tokens: int = 120, flare=None) -> list[list[int]]:
-        states, _, padding = self.encode(features, lengths, flare)
+        states, _, padding, _ = self.encode(features, lengths, flare)
         batch = features.shape[0]
         tokens = torch.full((batch, 1), self.sos_eos, dtype=torch.long, device=features.device)
         done = torch.zeros(batch, dtype=torch.bool, device=features.device)
@@ -341,7 +349,7 @@ class LipReader(nn.Module):
     def beam_search(self, features, length, *, beam: int = 10, ctc_weight: float = 0.1, max_tokens: int = 120,
                     length_bonus: float = 0.5) -> list[int]:
         """One clip. Attention beam search, then rescoring of finished beams with the CTC head."""
-        states, lengths, padding = self.encode(features[None], length[None])
+        states, lengths, padding, _ = self.encode(features[None], length[None])
         ctc_log_probs = self.ctc(states).float().log_softmax(-1).transpose(0, 1)
         beams, finished = [([self.sos_eos], 0.0)], []
         for _ in range(max_tokens):

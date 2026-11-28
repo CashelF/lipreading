@@ -23,7 +23,7 @@ from torch.utils.data import DataLoader
 
 from backend.word_errors import corpus_wer, score
 from training.data import FeatureBatches, restore, time_mask
-from training.model import LipReader
+from training.model import FLARE_DEPTH, LipReader
 from training.text import Vocabulary
 
 
@@ -46,7 +46,7 @@ def evaluate(model, loader, vocabulary, device, limit: int) -> dict:
     rows, losses, clips = [], [], 0
     for front, frames, tokens, token_counts, teacher, texts in loader:
         features, frames = restore(front.to(device)), frames.to(device)
-        flare = restore(teacher.to(device)) if model.whole_flare else None
+        flare = restore(teacher.to(device)) if model.flare.whole else None
         with torch.autocast('cuda', torch.bfloat16):
             loss = model(features, frames, tokens.to(device), token_counts.to(device), teacher=flare)[0]
             predictions = model.greedy(features, frames, flare=flare)
@@ -77,9 +77,11 @@ def main():
     parser.add_argument('--teacher-weight', type=float, default=5.0,
                         help='Weight of the loss for reproducing FLARE\'s encoder features, against the text losses.')
     parser.add_argument('--workers', type=int, default=12)
-    parser.add_argument('--flare-layers', type=int, default=0,
-                        help='How many of FLARE\'s 18 encoder layers the model keeps, counted from the first '
-                             '(17M parameters each, never trained).')
+    parser.add_argument('--keep-layers', type=int, nargs='+', default=list(range(FLARE_DEPTH)),
+                        help='Which of FLARE\'s 18 encoder layers the model keeps (17M parameters each). With all of '
+                             'them, the default, the encoder stays as it is and only the text side is trained.')
+    parser.add_argument('--init', type=Path,
+                        help='Checkpoint whose text side starts a new run: the first stage\'s, when layers are dropped.')
     parser.add_argument('--dim', type=int, default=256)
     parser.add_argument('--layers', type=int, default=12, help='Layers of the small Conformer on top.')
     parser.add_argument('--dev-clips', type=int, default=1500)
@@ -90,11 +92,15 @@ def main():
     device = torch.device('cuda')
     args.output.mkdir(parents=True, exist_ok=True)
     vocabulary = Vocabulary(args.vocabulary)
-    model = LipReader(vocabulary.size, flare_layers=args.flare_layers, dim=args.dim, layers=args.layers).to(device)
+    model = LipReader(vocabulary.size, keep=args.keep_layers, dim=args.dim, layers=args.layers).to(device)
     # The front end is FLARE's and stays as it is; training never runs it, but the checkpoint must hold it.
     model.frontend.load_state_dict(torch.load(args.features / 'frontend.pt', map_location=device))
-    if model.flare is not None:
-        model.flare.load_flare(torch.load(args.features / 'encoder.pt', map_location=device))
+    model.flare.load_flare(torch.load(args.features / 'encoder.pt', map_location=device))
+    if args.init:
+        text_side = {name: value for name, value in torch.load(args.init, map_location=device, weights_only=False)['model'].items()
+                     if not name.startswith(('frontend.', 'flare.'))}
+        missing = model.load_state_dict(text_side, strict=False).missing_keys
+        assert all(name.startswith(('frontend.', 'flare.')) for name in missing), missing
     trained = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW([{'params': [p for p in trained if p.ndim > 1], 'weight_decay': args.weight_decay},
                                    {'params': [p for p in trained if p.ndim <= 1], 'weight_decay': 0.0}],
@@ -128,7 +134,7 @@ def main():
 
     def checkpoint_state():
         return {'model': model.state_dict(), 'optimizer': optimizer.state_dict(), 'state': state,
-                'config': {'flare_layers': args.flare_layers, 'dim': args.dim, 'layers': args.layers,
+                'config': {'keep': model.flare.keep, 'dim': args.dim, 'layers': args.layers,
                            'vocab_size': vocabulary.size}}
 
     def check():

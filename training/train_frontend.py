@@ -95,7 +95,7 @@ def main():
     frontend = Frontend().to(device)
     frontend.load_state_dict(torch.load(args.features / 'frontend.pt', map_location=device))
     # FLARE's encoder, frozen: gradients pass through it to the front end, none of its weights change.
-    flare = FlareStack(FLARE_DEPTH).to(device)
+    flare = FlareStack(range(FLARE_DEPTH)).to(device)
     flare.load_flare(torch.load(args.features / 'encoder.pt', map_location=device))
     optimizer = torch.optim.AdamW(frontend.parameters(), lr=args.lr, betas=(0.9, 0.98), weight_decay=0.01)
     dev_shards = [str(Path(shard).resolve()) for shard in args.dev]
