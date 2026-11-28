@@ -222,7 +222,7 @@ def test_clip_targets_pair_each_clip_with_its_own_stored_features(tmp_path, voca
     video, frames = torch.randn(2, 5, 64, 64), torch.tensor([5, 3])
     with torch.no_grad():
         features = torch.nn.functional.layer_norm(frontend(video), (768,))
-        deep = torch.nn.functional.layer_norm(flare(features, torch.arange(5)[None] >= frames[:, None]), (768,))
+        deep = torch.nn.functional.layer_norm(flare(features, torch.arange(5)[None] >= frames[:, None])[-1], (768,))
     loss, cosine, deep_cosine = both_distances(frontend, flare, video, torch.cat([features, deep], -1), frames)
     assert float(loss) == pytest.approx(0, abs=1e-3) and float(deep_cosine) == pytest.approx(1, abs=1e-3)
     loss, _, deep_cosine = both_distances(frontend, flare, video, torch.cat([features, deep.roll(1, -1)], -1), frames)
@@ -317,7 +317,18 @@ def test_teacher_loss_counts_only_real_frames_and_is_zero_for_a_perfect_copy(voc
         assert float(model(features, frames, tokens, counts, teacher=changed)[3]) == pytest.approx(float(teacher), rel=1e-5)
         # The target is what the FLARE layers that are left put out, standardized per frame.
         _, _, _, deep = model.encode(features, frames)
+        assert float(model(features, frames, tokens, counts, teacher=deep[-1])[3]) == pytest.approx(0, abs=1e-5)
+    # With a target for each kept layer, every layer carries an equal share and the count must match.
+    model = LipReader(words.size, **{**TINY, 'keep': [0, 1]}).eval()
+    with torch.no_grad():
+        _, _, _, deep = model.encode(features, frames)
+        both = float(model(features, frames, tokens, counts, teacher=[wanted, wanted])[3])
+        first = float(model(features, frames, tokens, counts, teacher=[wanted, deep[1]])[3])
+        last = float(model(features, frames, tokens, counts, teacher=[deep[0], wanted])[3])
+        assert first + last == pytest.approx(both, rel=1e-4) and first > 0 and last > 0
         assert float(model(features, frames, tokens, counts, teacher=deep)[3]) == pytest.approx(0, abs=1e-5)
+        with pytest.raises(ValueError):
+            model(features, frames, tokens, counts, teacher=[wanted])
 
 
 def test_a_clip_is_encoded_the_same_alone_or_beside_a_longer_clip(vocabulary):
@@ -369,7 +380,8 @@ def test_flare_stack_loads_the_layers_it_keeps_and_ignores_padding():
     with torch.no_grad():
         together = stack(features, padding)
         alone = stack(features[1:, :25], padding[1:, :25])
-    assert together.shape == (2, 60, 768) and torch.allclose(together[1, :25], alone[0], atol=1e-4)
+    assert len(together) == 2 and together[-1].shape == (2, 60, 768)  # One output per layer.
+    assert all(torch.allclose(batched[1, :25], single[0], atol=1e-4) for batched, single in zip(together, alone))
 
 
 def test_whole_flare_encoder_is_frozen_and_read_from_stored_features(vocabulary, monkeypatch):

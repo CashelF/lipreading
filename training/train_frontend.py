@@ -72,7 +72,7 @@ def both_distances(frontend, flare, video, wanted, frames):
     features = F.layer_norm(frontend(video).float(), (Frontend.dim,))
     padding = torch.arange(features.shape[1], device=features.device)[None] >= frames.to(features.device)[:, None]
     near, cosine = distance(features, wanted[..., :Frontend.dim], frames)
-    far, deep_cosine = distance(flare(features, padding), wanted[..., Frontend.dim:], frames)
+    far, deep_cosine = distance(flare(features, padding)[-1], wanted[..., Frontend.dim:], frames)
     return near + far, cosine, deep_cosine
 
 
