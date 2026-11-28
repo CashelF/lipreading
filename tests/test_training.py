@@ -194,7 +194,7 @@ def test_time_mask_hides_whole_frames_inside_each_clip():
 
 
 def test_clip_targets_pair_each_clip_with_its_own_stored_features(tmp_path, vocabulary):
-    from training.train_frontend import ClipTargets, distance
+    from training.train_frontend import ClipTargets, both_distances, distance
     clips = [(60, SENTENCES[0]), (72, SENTENCES[1]), (66, SENTENCES[2])]
     shard = write_shard(tmp_path / 'part.tar', clips)
     # Features are stored in another order than the shard's, as extraction sorts clips by length.
@@ -202,17 +202,33 @@ def test_clip_targets_pair_each_clip_with_its_own_stored_features(tmp_path, voca
     folder.mkdir(parents=True)
     order = [2, 0, 1]
     np.save(folder / 'front.npy', np.concatenate([np.full((clips[n][0], 768), n, np.int8) for n in order]))
+    np.save(folder / 'teacher.npy', np.concatenate([np.full((clips[n][0], 768), n + 10, np.int8) for n in order]))
     (folder / 'index.json').write_text(json.dumps({'clips': [[f'clip{n:04d}', clips[n][1], clips[n][0]] for n in order]}))
     seen = {}
     for video, frames, _, _, wanted in ClipTargets([shard], tmp_path / 'features', vocabulary, frames_per_batch=80, shuffle=False):
-        assert video.shape[1:] == (int(frames.max()), 96, 96) and wanted.shape == (len(frames), int(frames.max()), 768)
+        assert video.shape[1:] == (int(frames.max()), 96, 96) and wanted.shape == (len(frames), int(frames.max()), 1536)
         for row, count in enumerate(frames.tolist()):
             seen[count] = int(wanted[row, 0, 0])
-            assert (wanted[row, :count] == wanted[row, 0, 0]).all() and not wanted[row, count:].any()
+            assert (wanted[row, :count, :768] == seen[count]).all() and (wanted[row, :count, 768:] == seen[count] + 10).all()
+            assert not wanted[row, count:].any()
     assert seen == {60: 0, 72: 1, 66: 2}  # Each clip length came with the features stored under its own key.
     same = torch.randn(2, 9, 768)
     loss, cosine = distance(same * 3 + 1, torch.nn.functional.layer_norm(same, (768,)), torch.tensor([9, 4]))
     assert float(loss) == pytest.approx(0, abs=1e-4) and float(cosine) == pytest.approx(1, abs=1e-4)
+    # With FLARE's encoder behind it, the front end is also judged on what the encoder makes of its features,
+    # and the gradient for that reaches the front end through the frozen encoder.
+    torch.manual_seed(11)
+    frontend, flare = Frontend(), FlareStack(1)
+    video, frames = torch.randn(2, 5, 64, 64), torch.tensor([5, 3])
+    with torch.no_grad():
+        features = torch.nn.functional.layer_norm(frontend(video), (768,))
+        deep = torch.nn.functional.layer_norm(flare(features, torch.arange(5)[None] >= frames[:, None]), (768,))
+    loss, cosine, deep_cosine = both_distances(frontend, flare, video, torch.cat([features, deep], -1), frames)
+    assert float(loss) == pytest.approx(0, abs=1e-3) and float(deep_cosine) == pytest.approx(1, abs=1e-3)
+    loss, _, deep_cosine = both_distances(frontend, flare, video, torch.cat([features, deep.roll(1, -1)], -1), frames)
+    loss.backward()
+    assert float(deep_cosine) < 0.9 and frontend.frontend3D[0].weight.grad.abs().sum() > 0
+    assert all(p.grad is None for p in flare.parameters())
 
 
 def test_front_end_runs_on_smaller_frames():
@@ -344,6 +360,7 @@ def test_flare_stack_keeps_the_first_layers_frozen_and_ignores_padding():
     stack.load_flare(whole)
     assert [float(layer.post_layernorm.weight[0]) for layer in stack.layers] == [0, 1]  # The first two of the 18.
     stack = FlareStack(2)
+    assert not stack.training and not any(module.training for module in stack.modules())  # From the start: no dropout.
     stack.train()
     assert not stack.training and not any(p.requires_grad for p in stack.parameters())
     features, frames = torch.randn(2, 60, 768), torch.tensor([60, 25])

@@ -99,9 +99,9 @@ The front end is most of the model's compute: on this GPU 1.7 ms per second of v
   --output data/train/frontends/res64
 ```
 
-It starts from FLARE's front-end weights and learns, from video resized to the given size, to reproduce the features `extract_features.py` saved at full resolution. `evaluate.py --frontend data/train/frontends/res64/frontend.pt` scores any trained checkpoint with it swapped in.
+It starts from FLARE's front-end weights and learns, from video resized to the given size, to reproduce what `extract_features.py` saved at full resolution: the front end's own features and, through FLARE's frozen encoder, the encoder's output. `evaluate.py --frontend data/train/frontends/res64/frontend.pt` scores any trained checkpoint with it swapped in.
 
-Measured 2026-11-27 with the whole-FLARE-encoder checkpoint trained on AVYT only, and nothing but the front end changed. The 64×64 front end was trained for 400 video-hours on AVYT clips (dev cosine to FLARE's features 0.965) and costs 2.25 times less.
+Measured 2026-11-27 with the whole-FLARE-encoder checkpoint trained on AVYT only, and nothing but the front end changed. The 64×64 front end was trained for 400 video-hours on AVYT clips against the front-end features alone, before the encoder-output target was added (dev cosine to FLARE's features 0.965), and costs 2.25 times less.
 
 | Front end | Dev WER (323 clips, greedy) | Held-out WER (159 clips, beam 5) |
 | --- | --- | --- |
