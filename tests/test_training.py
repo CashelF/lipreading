@@ -321,31 +321,39 @@ def test_flare_stack_keeps_evenly_spaced_layers_and_ignores_padding():
     with torch.no_grad():
         together = stack(features, padding)
         alone = stack(features[1:, :25], padding[1:, :25])
-    assert torch.allclose(together[1, :25], alone[0], atol=1e-4)
+    assert len(together) == 2  # One output per layer.
+    assert all(torch.allclose(batched[1, :25], single[0], atol=1e-4) for batched, single in zip(together, alone))
 
 
-def test_model_with_flare_layers_copies_the_teacher_from_them(vocabulary, monkeypatch):
+def test_model_with_flare_layers_copies_the_teacher_layer_by_layer(vocabulary, monkeypatch):
     torch.manual_seed(9)
     words = Vocabulary(vocabulary)
     features, frames, tokens, counts = tiny_batch(words)
-    wanted = torch.randn(2, 30, 768)
-    model = LipReader(words.size, flare_layers=1, **TINY).eval()
+    model = LipReader(words.size, flare_layers=2, **TINY).eval()
+    assert model.teacher is None and any(p.requires_grad for p in model.flare.parameters())
+    wanted = [torch.randn(2, 30, 768), torch.randn(2, 30, 768)]
     with torch.no_grad():
         loss, ctc, attention, teacher = model(features, frames, tokens, counts, teacher=wanted, teacher_weight=1.0)
-        _, _, _, wide = model.encode(features, frames)
-        assert wide.shape == (2, 30, 768) and teacher > 0 and torch.isfinite(loss)
-        assert float(model(features, frames, tokens, counts, teacher=model.teacher(wide))[3]) == pytest.approx(0, abs=1e-5)
-    assert any(p.requires_grad for p in model.flare.parameters())
+        _, _, _, kept = model.encode(features, frames)
+        assert len(kept) == 2 and kept[0].shape == (2, 30, 768) and teacher > 0 and torch.isfinite(loss)
+        standardized = [torch.nn.functional.layer_norm(layer, (768,)) for layer in kept]
+        # A perfect copy at one layer halves nothing: each layer is half of the loss.
+        only_last = float(model(features, frames, tokens, counts, teacher=[wanted[0], standardized[1]])[3])
+        only_first = float(model(features, frames, tokens, counts, teacher=[standardized[0], wanted[1]])[3])
+        assert only_last + only_first == pytest.approx(float(teacher), rel=1e-4)
+        assert float(model(features, frames, tokens, counts, teacher=standardized)[3]) == pytest.approx(0, abs=1e-5)
+        with pytest.raises(ValueError):
+            model(features, frames, tokens, counts, teacher=wanted[:1])
     # With every FLARE layer the encoder is FLARE's own: nothing to copy, nothing in it trained, and
     # training hands in FLARE's stored output instead of running the layers.
     monkeypatch.setattr(training.model, 'FLARE_DEPTH', 1)
     model = LipReader(words.size, flare_layers=1, **TINY).eval()
     assert model.whole_flare and not any(p.requires_grad for p in model.flare.parameters())
     with torch.no_grad():
-        loss, _, _, teacher = model(features, frames, tokens, counts, teacher=wanted, teacher_weight=1.0)
+        loss, _, _, teacher = model(features, frames, tokens, counts, teacher=wanted[0], teacher_weight=1.0)
         assert teacher == 0
-        states, _, _, _ = model.encode(features, frames, wanted)
-        again, _, _, _ = model.encode(torch.randn_like(features), frames, wanted)
+        states, _, _, _ = model.encode(features, frames, wanted[0])
+        again, _, _, _ = model.encode(torch.randn_like(features), frames, wanted[0])
         assert torch.allclose(states, again)  # The stored FLARE output is all it reads.
 
 
