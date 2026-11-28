@@ -1,4 +1,4 @@
-"""Lip clips to text: FLARE's ConvNeXt lip front end, a small Conformer, CTC and attention heads."""
+"""Lip clips to text: FLARE's lip front end, some of FLARE's encoder layers and a small Conformer, CTC and attention heads."""
 from __future__ import annotations
 
 import math
@@ -74,6 +74,137 @@ class Frontend(nn.Module):
         return self.trunk(y).view(batch, frames, self.dim)
 
 
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight, self.eps = nn.Parameter(torch.ones(dim)), eps
+
+    def forward(self, x):
+        y = x.float()
+        return self.weight * (y * torch.rsqrt(y.pow(2).mean(-1, keepdim=True) + self.eps)).to(x.dtype)
+
+
+class GatedMLP(nn.Module):
+    def __init__(self, dim: int, dropout: float):
+        super().__init__()
+        self.gate_proj, self.up_proj = nn.Linear(dim, 4 * dim, bias=False), nn.Linear(dim, 4 * dim, bias=False)
+        self.down_proj = nn.Linear(4 * dim, dim, bias=False)
+        self.dropout1, self.dropout2 = nn.Dropout(dropout), nn.Dropout(dropout)
+
+    def forward(self, x):
+        return self.dropout2(self.down_proj(self.dropout1(F.silu(self.gate_proj(x)) * self.up_proj(x))))
+
+
+class RotaryAttention(nn.Module):
+    """Self-attention with rotary positions; keys and values use fewer heads than queries and are shared."""
+
+    def __init__(self, dim: int, heads: int, shared_heads: int, dropout: float, theta: float = 1e6):
+        super().__init__()
+        self.heads, self.shared_heads, self.head_dim, self.theta = heads, shared_heads, dim // heads, theta
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj, self.v_proj = nn.Linear(dim, shared_heads * self.head_dim), nn.Linear(dim, shared_heads * self.head_dim)
+        self.o_proj = nn.Linear(dim, dim, bias=False)
+        self.dropout1 = nn.Dropout(dropout)
+
+    def rotate(self, x):
+        """Turn each pair of channels by an angle that grows with the frame's position."""
+        count = x.shape[-2]
+        rate = 1.0 / self.theta ** (torch.arange(0, self.head_dim, 2, device=x.device).float() / self.head_dim)
+        angle = torch.outer(torch.arange(count, device=x.device).float(), rate).repeat(1, 2)
+        first, second = x.chunk(2, -1)
+        return x * angle.cos().to(x.dtype) + torch.cat([-second, first], -1) * angle.sin().to(x.dtype)
+
+    def forward(self, x, padding):
+        batch, count, _ = x.shape
+        split = lambda y, heads: y.view(batch, count, heads, self.head_dim).transpose(1, 2)
+        query = self.rotate(split(self.q_proj(x), self.heads))
+        key = self.rotate(split(self.k_proj(x), self.shared_heads)).repeat_interleave(self.heads // self.shared_heads, 1)
+        value = split(self.v_proj(x), self.shared_heads).repeat_interleave(self.heads // self.shared_heads, 1)
+        attended = F.scaled_dot_product_attention(query, key, value, attn_mask=~padding[:, None, None])
+        return self.dropout1(self.o_proj(attended.transpose(1, 2).reshape(batch, count, -1)))
+
+
+class DepthwiseConv(nn.Module):
+    def __init__(self, dim: int, kernel: int):
+        super().__init__()
+        self.conv = nn.Conv1d(dim, dim, kernel, groups=dim)
+
+    def forward(self, x):
+        return self.conv(F.pad(x, (self.conv.kernel_size[0] // 2,) * 2))
+
+
+class ConvBlock(nn.Module):
+    def __init__(self, dim: int, dropout: float):
+        super().__init__()
+        # The slots without weights keep FLARE's numbering, so its checkpoint loads by name.
+        self.net = nn.ModuleList([RMSNorm(dim), nn.Linear(dim, 2 * dim), nn.Identity(), nn.Identity(), DepthwiseConv(dim, 15),
+                                  nn.Identity(), RMSNorm(dim), nn.Identity(), nn.Linear(dim, dim), nn.Dropout(dropout)])
+
+    def forward(self, x, padding):
+        kept, gate = self.net[1](self.net[0](x)).transpose(1, 2).chunk(2, 1)
+        # FLARE does not zero padded frames here, so they leak into real ones; the app never pads.
+        # Zeroing them makes a batched clip equal the same clip alone, which is what FLARE was run as.
+        y = self.net[4]((kept * gate.sigmoid()).masked_fill(padding[:, None], 0))
+        y = self.net[6](y.transpose(1, 2))
+        return self.net[9](self.net[8](y * y.sigmoid()))
+
+
+class FlareLayer(nn.Module):
+    """One layer of FLARE's encoder (``Qwen2DecoderLayer`` in its ``qwen_conformer.py``), parameter names included."""
+
+    def __init__(self, dim: int = 768, heads: int = 12, shared_heads: int = 2, dropout: float = 0.1):
+        super().__init__()
+        self.self_attn = RotaryAttention(dim, heads, shared_heads, dropout)
+        self.mlp1, self.mlp2, self.conv = GatedMLP(dim, dropout), GatedMLP(dim, dropout), ConvBlock(dim, dropout)
+        self.input_layernorm1, self.input_layernorm2, self.input_layernorm3 = RMSNorm(dim), RMSNorm(dim), RMSNorm(dim)
+        self.post_layernorm = RMSNorm(dim)
+
+    def forward(self, x, padding):
+        x = x + 0.5 * self.mlp1(self.input_layernorm1(x))
+        x = x + self.self_attn(self.input_layernorm2(x), padding)
+        x = x + self.conv(x, padding)
+        x = x + 0.5 * self.mlp2(self.input_layernorm3(x))
+        return self.post_layernorm(x)
+
+
+FLARE_DEPTH = 18
+
+
+class FlareStack(nn.Module):
+    """Some or all of FLARE's 18 encoder layers, with the steps FLARE runs before them, starting from its weights.
+
+    Fewer layers make a smaller model that has to be trained to give what all 18 gave.
+    """
+
+    def __init__(self, count: int, dropout: float = 0.1):
+        super().__init__()
+        self.keep = sorted({round(index * (FLARE_DEPTH - 1) / max(1, count - 1)) for index in range(count)})
+        self.lip_proj = nn.Linear(TEACHER_DIM, TEACHER_DIM)
+        self.mix_norm, self.mix_proj = nn.LayerNorm(3 * TEACHER_DIM), nn.Linear(3 * TEACHER_DIM, TEACHER_DIM)
+        self.dropout = nn.Dropout(dropout)
+        self.layers = nn.ModuleList(FlareLayer(dropout=dropout) for _ in self.keep)
+
+    def load_flare(self, state: dict):
+        """state: what extract_features.py saved as encoder.pt (all 18 layers)."""
+        chosen = {}
+        for name, value in state.items():
+            part, _, rest = name.partition('.')
+            if part != 'layers':
+                chosen[name] = value
+            elif int(rest.split('.')[0]) in self.keep:
+                index, _, inner = rest.partition('.')
+                chosen[f'layers.{self.keep.index(int(index))}.{inner}'] = value
+        self.load_state_dict(chosen)
+
+    def forward(self, features, padding):
+        lip = self.lip_proj(features)
+        # FLARE joins three streams here: audio, face and lip. The first two are absent, as in its lip-only use.
+        x = self.dropout(self.mix_proj(self.mix_norm(torch.cat([torch.zeros_like(lip), torch.zeros_like(lip), lip], -1))))
+        for layer in self.layers:
+            x = layer(x, padding)
+        return x
+
+
 def positions(length: int, dim: int, device) -> torch.Tensor:
     position = torch.arange(length, device=device).unsqueeze(1)
     scale = torch.exp(torch.arange(0, dim, 2, device=device) * (-math.log(10000.0) / dim))
@@ -83,22 +214,30 @@ def positions(length: int, dim: int, device) -> torch.Tensor:
 
 
 class LipReader(nn.Module):
-    """FLARE's lip front end (kept as it is), then a small Conformer, a CTC head and an attention decoder.
+    """FLARE's lip front end (kept as it is), ``flare_layers`` of FLARE's 18 encoder layers, a small
+    Conformer of ``layers`` layers, a CTC head and an attention decoder.
 
-    Training reads the front end's output from disk (``extract_features.py``), so every method below
-    takes those features. On video, call ``front`` first.
+    ``flare_layers`` sets the size: 0 leaves a 40M model whose Conformer learns everything from scratch,
+    each FLARE layer adds 17M parameters that start from FLARE's weights, and 18 is FLARE's whole
+    encoder, kept as it is. Training reads the front end's output from disk (``extract_features.py``),
+    so every method below takes those features. On video, call ``front`` first.
     """
 
-    def __init__(self, vocab_size: int, *, dim: int = 256, layers: int = 12, heads: int = 4,
+    def __init__(self, vocab_size: int, *, flare_layers: int = 0, dim: int = 256, layers: int = 12, heads: int = 4,
                  decoder_layers: int = 6, dropout: float = 0.1):
         super().__init__()
         self.vocab_size, self.dim = vocab_size, dim
         self.sos_eos = vocab_size - 1
         self.frontend = Frontend().requires_grad_(False)
+        self.flare = FlareStack(flare_layers, dropout) if flare_layers else None
+        self.whole_flare = flare_layers == FLARE_DEPTH
+        if self.whole_flare:
+            self.flare.requires_grad_(False)
         self.project = nn.Sequential(nn.Linear(Frontend.dim, dim), nn.LayerNorm(dim))
         self.encoder = Conformer(dim, heads, 4 * dim, layers, 31, dropout=dropout)
         self.ctc = nn.Linear(dim, vocab_size)
-        self.teacher = nn.Linear(dim, TEACHER_DIM)  # Training only: FLARE's encoder output for each frame.
+        # Training only: FLARE's encoder output for each frame, from the last FLARE layer if there is one.
+        self.teacher = nn.Linear(TEACHER_DIM if flare_layers else dim, TEACHER_DIM)
         self.embed = nn.Embedding(vocab_size, dim)
         layer = nn.TransformerDecoderLayer(dim, heads, 4 * dim, dropout, batch_first=True, norm_first=True)
         self.decoder = nn.TransformerDecoder(layer, decoder_layers, norm=nn.LayerNorm(dim))
@@ -109,10 +248,17 @@ class LipReader(nn.Module):
         """Normalized video (B, T, 88, 88) to features (B, T, 768), standardized per frame as they are on disk."""
         return F.layer_norm(self.frontend(video).float(), (Frontend.dim,))
 
-    def encode(self, features, lengths):
-        """features: (B, T, 768). Returns encoder states, their lengths and a padding mask."""
+    def encode(self, features, lengths, wide=None):
+        """features: (B, T, 768). Returns encoder states, their lengths, a padding mask, and the FLARE
+        layers' output (None without FLARE layers). ``wide`` supplies that output when it is already
+        known: with all 18 layers it is FLARE's own, which training reads from disk."""
         features = features[:, :int(lengths.max())]
         padding = torch.arange(features.shape[1], device=features.device)[None] >= lengths[:, None]
+        if self.flare is not None:
+            wide = self.flare(features, padding) if wide is None else wide[:, :features.shape[1]]
+            if self.whole_flare:  # Stored features are standardized per frame; match that on video too.
+                wide = F.layer_norm(wide.float(), (TEACHER_DIM,))
+            features = wide
         x = self.project(features).transpose(0, 1)  # (T, B, D)
         for layer in self.encoder.conformer_layers:
             # torchaudio's ConformerLayer.forward, with one addition: padded frames are zeroed just before
@@ -128,7 +274,7 @@ class LipReader(nn.Module):
                 y = step(y.masked_fill(padding[:, None], 0)) if step is rest[0] else step(y)
             x = y.permute(2, 0, 1) + x
             x = layer.final_layer_norm(layer.ffn2(x) * 0.5 + x)
-        return x.transpose(0, 1), lengths, padding
+        return x.transpose(0, 1), lengths, padding, wide
 
     def decode_step(self, tokens, states, padding):
         """Next-token logits for every position of ``tokens`` (B, U)."""
@@ -144,7 +290,7 @@ class LipReader(nn.Module):
 
         Returns (loss, ctc_loss, attention_loss, teacher_loss): the text losses per token, the teacher loss per frame.
         """
-        states, lengths, padding = self.encode(features, lengths)
+        states, lengths, padding, wide = self.encode(features, lengths, teacher if self.whole_flare else None)
         log_probs = self.ctc(states).float().log_softmax(-1).transpose(0, 1)
         # Both text losses are per token, so the weights mean what they say whatever the clip length.
         ctc = F.ctc_loss(log_probs, targets, lengths, target_lengths, blank=0, reduction='sum', zero_infinity=True)
@@ -160,17 +306,18 @@ class LipReader(nn.Module):
         attention = F.cross_entropy(logits.flatten(0, 1), expected.flatten(), ignore_index=-100,
                                     label_smoothing=smoothing)
         copied = ctc.new_zeros(())
-        if teacher is not None:
+        if teacher is not None and not self.whole_flare:
             # Text gives one signal per clip. The teacher gives a full target for every frame, computed
             # from the same video, and that is what gets a small model reading: distance plus direction.
-            predicted, wanted = self.teacher(states).float()[~padding], teacher[:, :states.shape[1]][~padding]
+            predicted = self.teacher(states if wide is None else wide).float()[~padding]
+            wanted = teacher[:, :states.shape[1]][~padding]
             copied = F.l1_loss(predicted, wanted) + 1 - F.cosine_similarity(predicted, wanted, dim=-1).mean()
         loss = ctc_weight * ctc + (1 - ctc_weight) * attention + teacher_weight * copied
         return loss, ctc.detach(), attention.detach(), copied.detach()
 
     @torch.no_grad()
-    def greedy(self, features, lengths, max_tokens: int = 120) -> list[list[int]]:
-        states, _, padding = self.encode(features, lengths)
+    def greedy(self, features, lengths, max_tokens: int = 120, wide=None) -> list[list[int]]:
+        states, _, padding, _ = self.encode(features, lengths, wide)
         batch = features.shape[0]
         tokens = torch.full((batch, 1), self.sos_eos, dtype=torch.long, device=features.device)
         done = torch.zeros(batch, dtype=torch.bool, device=features.device)
@@ -190,7 +337,7 @@ class LipReader(nn.Module):
     def beam_search(self, features, length, *, beam: int = 10, ctc_weight: float = 0.1, max_tokens: int = 120,
                     length_bonus: float = 0.5) -> list[int]:
         """One clip. Attention beam search, then rescoring of finished beams with the CTC head."""
-        states, lengths, padding = self.encode(features[None], length[None])
+        states, lengths, padding, _ = self.encode(features[None], length[None])
         ctc_log_probs = self.ctc(states).float().log_softmax(-1).transpose(0, 1)
         beams, finished = [([self.sos_eos], 0.0)], []
         for _ in range(max_tokens):

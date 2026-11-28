@@ -24,7 +24,7 @@ from training.text import Vocabulary
 def load(checkpoint_path: Path, device) -> LipReader:
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config = checkpoint['config']
-    model = LipReader(config['vocab_size'], dim=config['dim'], layers=config['layers'])
+    model = LipReader(config['vocab_size'], flare_layers=config['flare_layers'], dim=config['dim'], layers=config['layers'])
     model.load_state_dict(checkpoint['model'])
     return model.to(device).eval()
 
