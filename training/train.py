@@ -19,11 +19,12 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from backend.word_errors import corpus_wer, score
 from training.data import FeatureBatches, restore, time_mask
-from training.model import LipReader
+from training.model import FLARE_DEPTH, FlareStack, LipReader
 from training.text import Vocabulary
 
 
@@ -93,8 +94,15 @@ def main():
     model = LipReader(vocabulary.size, flare_layers=args.flare_layers, dim=args.dim, layers=args.layers).to(device)
     # The front end is FLARE's and stays as it is; training never runs it, but the checkpoint must hold it.
     model.frontend.load_state_dict(torch.load(args.features / 'frontend.pt', map_location=device))
+    reference = None
     if model.flare is not None:
-        model.flare.load_flare(torch.load(args.features / 'encoder.pt', map_location=device))
+        flare_state = torch.load(args.features / 'encoder.pt', map_location=device)
+        model.flare.load_flare(flare_state)
+        if not model.whole_flare:
+            # The kept layers learn from FLARE's layers at the same positions, so all 18 run beside them (no gradients).
+            reference = FlareStack(FLARE_DEPTH).to(device).eval().requires_grad_(False)
+            reference.load_flare(flare_state)
+        del flare_state
     trained = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW([{'params': [p for p in trained if p.ndim > 1], 'weight_decay': args.weight_decay},
                                    {'params': [p for p in trained if p.ndim <= 1], 'weight_decay': 0.0}],
@@ -155,11 +163,19 @@ def main():
             lr = learning_rate(state['hours_seen'], total_hours, warmup_hours, args.lr)
             for group in optimizer.param_groups:
                 group['lr'] = lr
-            features = time_mask(restore(front.to(device, non_blocking=True)), frames)
+            clean = restore(front.to(device, non_blocking=True))
             with torch.autocast('cuda', torch.bfloat16):
+                if reference is None:
+                    wanted = restore(teacher.to(device, non_blocking=True))
+                else:
+                    with torch.no_grad():
+                        padding = torch.arange(clean.shape[1], device=device)[None] >= frames.to(device)[:, None]
+                        every = reference(clean, padding)
+                        wanted = [F.layer_norm(every[index].float(), clean.shape[-1:]) for index in model.flare.keep]
+                        del every
                 loss, ctc, attention, copied = model(
-                    features, frames.to(device), tokens.to(device), token_counts.to(device),
-                    teacher=restore(teacher.to(device, non_blocking=True)), teacher_weight=args.teacher_weight)
+                    time_mask(clean, frames), frames.to(device), tokens.to(device), token_counts.to(device),
+                    teacher=wanted, teacher_weight=args.teacher_weight)
             optimizer.zero_grad(set_to_none=True)
             if torch.isfinite(loss):
                 loss.backward()

@@ -196,13 +196,16 @@ class FlareStack(nn.Module):
                 chosen[f'layers.{self.keep.index(int(index))}.{inner}'] = value
         self.load_state_dict(chosen)
 
-    def forward(self, features, padding):
+    def forward(self, features, padding) -> list:
+        """The output of every layer, in order; the last is the stack's output."""
         lip = self.lip_proj(features)
         # FLARE joins three streams here: audio, face and lip. The first two are absent, as in its lip-only use.
         x = self.dropout(self.mix_proj(self.mix_norm(torch.cat([torch.zeros_like(lip), torch.zeros_like(lip), lip], -1))))
+        outputs = []
         for layer in self.layers:
             x = layer(x, padding)
-        return x
+            outputs.append(x)
+        return outputs
 
 
 def positions(length: int, dim: int, device) -> torch.Tensor:
@@ -236,8 +239,9 @@ class LipReader(nn.Module):
         self.project = nn.Sequential(nn.Linear(Frontend.dim, dim), nn.LayerNorm(dim))
         self.encoder = Conformer(dim, heads, 4 * dim, layers, 31, dropout=dropout)
         self.ctc = nn.Linear(dim, vocab_size)
-        # Training only: FLARE's encoder output for each frame, from the last FLARE layer if there is one.
-        self.teacher = nn.Linear(TEACHER_DIM if flare_layers else dim, TEACHER_DIM)
+        # Training only, and only without FLARE layers: FLARE's encoder output for each frame. Kept FLARE
+        # layers are compared with the teacher directly.
+        self.teacher = None if flare_layers else nn.Linear(dim, TEACHER_DIM)
         self.embed = nn.Embedding(vocab_size, dim)
         layer = nn.TransformerDecoderLayer(dim, heads, 4 * dim, dropout, batch_first=True, norm_first=True)
         self.decoder = nn.TransformerDecoder(layer, decoder_layers, norm=nn.LayerNorm(dim))
@@ -249,16 +253,16 @@ class LipReader(nn.Module):
         return F.layer_norm(self.frontend(video).float(), (Frontend.dim,))
 
     def encode(self, features, lengths, wide=None):
-        """features: (B, T, 768). Returns encoder states, their lengths, a padding mask, and the FLARE
-        layers' output (None without FLARE layers). ``wide`` supplies that output when it is already
-        known: with all 18 layers it is FLARE's own, which training reads from disk."""
+        """features: (B, T, 768). Returns encoder states, their lengths, a padding mask, and the output
+        of each kept FLARE layer (None without any). ``wide`` supplies the last of those when it is
+        already known: with all 18 layers it is FLARE's own, which training reads from disk."""
         features = features[:, :int(lengths.max())]
         padding = torch.arange(features.shape[1], device=features.device)[None] >= lengths[:, None]
+        kept = None
         if self.flare is not None:
-            wide = self.flare(features, padding) if wide is None else wide[:, :features.shape[1]]
-            if self.whole_flare:  # Stored features are standardized per frame; match that on video too.
-                wide = F.layer_norm(wide.float(), (TEACHER_DIM,))
-            features = wide
+            kept = self.flare(features, padding) if wide is None else [wide[:, :features.shape[1]]]
+            # Stored features are standardized per frame; with the whole of FLARE, match that on video too.
+            features = F.layer_norm(kept[-1].float(), (TEACHER_DIM,)) if self.whole_flare else kept[-1]
         x = self.project(features).transpose(0, 1)  # (T, B, D)
         for layer in self.encoder.conformer_layers:
             # torchaudio's ConformerLayer.forward, with one addition: padded frames are zeroed just before
@@ -274,7 +278,7 @@ class LipReader(nn.Module):
                 y = step(y.masked_fill(padding[:, None], 0)) if step is rest[0] else step(y)
             x = y.permute(2, 0, 1) + x
             x = layer.final_layer_norm(layer.ffn2(x) * 0.5 + x)
-        return x.transpose(0, 1), lengths, padding, wide
+        return x.transpose(0, 1), lengths, padding, kept
 
     def decode_step(self, tokens, states, padding):
         """Next-token logits for every position of ``tokens`` (B, U)."""
@@ -286,11 +290,13 @@ class LipReader(nn.Module):
 
     def forward(self, features, lengths, targets, target_lengths, *, teacher=None, teacher_weight: float = 0.0,
                 ctc_weight: float = 0.1, smoothing: float = 0.1):
-        """targets: (B, U) padded with 0; teacher: FLARE's standardized encoder features (B, T, 768), or None.
+        """targets: (B, U) padded with 0. teacher: FLARE's standardized features to copy, or None: its
+        encoder output (B, T, 768), or with kept FLARE layers a list holding FLARE's output at each
+        kept layer's position.
 
         Returns (loss, ctc_loss, attention_loss, teacher_loss): the text losses per token, the teacher loss per frame.
         """
-        states, lengths, padding, wide = self.encode(features, lengths, teacher if self.whole_flare else None)
+        states, lengths, padding, kept = self.encode(features, lengths, teacher if self.whole_flare else None)
         log_probs = self.ctc(states).float().log_softmax(-1).transpose(0, 1)
         # Both text losses are per token, so the weights mean what they say whatever the clip length.
         ctc = F.ctc_loss(log_probs, targets, lengths, target_lengths, blank=0, reduction='sum', zero_infinity=True)
@@ -309,9 +315,12 @@ class LipReader(nn.Module):
         if teacher is not None and not self.whole_flare:
             # Text gives one signal per clip. The teacher gives a full target for every frame, computed
             # from the same video, and that is what gets a small model reading: distance plus direction.
-            predicted = self.teacher(states if wide is None else wide).float()[~padding]
-            wanted = teacher[:, :states.shape[1]][~padding]
-            copied = F.l1_loss(predicted, wanted) + 1 - F.cosine_similarity(predicted, wanted, dim=-1).mean()
+            # A kept FLARE layer stands in for the layers dropped before it, so each has its own target.
+            pairs = [(self.teacher(states), teacher)] if kept is None else \
+                [(F.layer_norm(mine.float(), (TEACHER_DIM,)), theirs) for mine, theirs in zip(kept, teacher, strict=True)]
+            for mine, theirs in pairs:
+                predicted, wanted = mine.float()[~padding], theirs[:, :states.shape[1]][~padding]
+                copied = copied + (F.l1_loss(predicted, wanted) + 1 - F.cosine_similarity(predicted, wanted, dim=-1).mean()) / len(pairs)
         loss = ctc_weight * ctc + (1 - ctc_weight) * attention + teacher_weight * copied
         return loss, ctc.detach(), attention.detach(), copied.detach()
 
