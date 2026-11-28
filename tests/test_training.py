@@ -29,7 +29,7 @@ torch.set_num_threads(1)
 
 SENTENCES = ['the quick brown fox jumps over the lazy dog', 'please pass the salt and the pepper',
              'we are leaving early in the morning', 'i left my keys on the kitchen table'] * 30
-TINY = dict(dim=32, layers=1, heads=2, decoder_layers=1)
+TINY = dict(keep=[0], dim=32, layers=1, heads=2, decoder_layers=1)  # One of FLARE's layers keeps tests light.
 
 
 def clip(frames=50, seed=0):
@@ -218,7 +218,7 @@ def test_clip_targets_pair_each_clip_with_its_own_stored_features(tmp_path, voca
     # With FLARE's encoder behind it, the front end is also judged on what the encoder makes of its features,
     # and the gradient for that reaches the front end through the frozen encoder.
     torch.manual_seed(11)
-    frontend, flare = Frontend(), FlareStack(1)
+    frontend, flare = Frontend(), FlareStack([0]).requires_grad_(False).eval()
     video, frames = torch.randn(2, 5, 64, 64), torch.tensor([5, 3])
     with torch.no_grad():
         features = torch.nn.functional.layer_norm(frontend(video), (768,))
@@ -273,6 +273,7 @@ def test_model_losses_and_decoders_on_a_tiny_network(vocabulary):
     loss.backward()
     assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
     assert all(p.grad is None for p in model.frontend.parameters())  # FLARE's front end is never trained.
+    assert model.flare.layers[0].mlp1.down_proj.weight.grad is not None  # The FLARE layers that are left are.
     model.eval()
     greedy = model.greedy(features, frames, max_tokens=6)
     assert len(greedy) == 2 and all(len(row) <= 6 and words.sos_eos not in row for row in greedy)
@@ -314,17 +315,18 @@ def test_teacher_loss_counts_only_real_frames_and_is_zero_for_a_perfect_copy(voc
         changed = wanted.clone()
         changed[1, 20:] += 100  # Past the end of the second clip.
         assert float(model(features, frames, tokens, counts, teacher=changed)[3]) == pytest.approx(float(teacher), rel=1e-5)
-        states, _, _ = model.encode(features, frames)
-        assert float(model(features, frames, tokens, counts, teacher=model.teacher(states))[3]) == pytest.approx(0, abs=1e-5)
+        # The target is what the FLARE layers that are left put out, standardized per frame.
+        _, _, _, deep = model.encode(features, frames)
+        assert float(model(features, frames, tokens, counts, teacher=deep)[3]) == pytest.approx(0, abs=1e-5)
 
 
 def test_a_clip_is_encoded_the_same_alone_or_beside_a_longer_clip(vocabulary):
     torch.manual_seed(6)
-    model = LipReader(Vocabulary(vocabulary).size, dim=32, layers=3, heads=2, decoder_layers=1).eval()
+    model = LipReader(Vocabulary(vocabulary).size, keep=[0, 1], dim=32, layers=3, heads=2, decoder_layers=1).eval()
     features, frames = torch.randn(2, 80, 768), torch.tensor([80, 30])
     with torch.no_grad():
-        together, _, padding = model.encode(features, frames)
-        alone, _, _ = model.encode(features[1:, :30], frames[1:])
+        together, _, padding, _ = model.encode(features, frames)
+        alone, _, _, _ = model.encode(features[1:, :30], frames[1:])
     assert padding[1, 30:].all() and not padding[1, :30].any()
     assert torch.allclose(together[1, :30], alone[0], atol=1e-5)
 
@@ -351,52 +353,46 @@ def test_flare_layer_matches_flare():
         assert torch.allclose(ours(x, padding), expected, atol=1e-5)
 
 
-def test_flare_stack_keeps_the_first_layers_frozen_and_ignores_padding():
+def test_flare_stack_loads_the_layers_it_keeps_and_ignores_padding():
     torch.manual_seed(8)
-    stack = FlareStack(2)
+    stack = FlareStack([17, 3])
     whole = {f'layers.{index}.{name}': torch.full_like(value, float(index))
              for index in range(18) for name, value in stack.layers[0].state_dict().items()}
     whole.update({name: value for name, value in stack.state_dict().items() if not name.startswith('layers.')})
     stack.load_flare(whole)
-    assert [float(layer.post_layernorm.weight[0]) for layer in stack.layers] == [0, 1]  # The first two of the 18.
-    stack = FlareStack(2)
-    assert not stack.training and not any(module.training for module in stack.modules())  # From the start: no dropout.
-    stack.train()
-    assert not stack.training and not any(p.requires_grad for p in stack.parameters())
+    assert stack.keep == [3, 17] and [float(layer.post_layernorm.weight[0]) for layer in stack.layers] == [3, 17]
+    # Fewer than all 18 layers: what is left is trained, and trains with dropout like any other part.
+    assert stack.training and all(p.requires_grad for p in stack.parameters())
+    stack = FlareStack([0, 1]).eval()
     features, frames = torch.randn(2, 60, 768), torch.tensor([60, 25])
     padding = torch.arange(60)[None] >= frames[:, None]
-    together = stack(features, padding)
-    alone = stack(features[1:, :25], padding[1:, :25])
-    assert together.shape == (2, 60, 768) and not together.requires_grad
-    assert torch.allclose(together[1, :25], alone[0], atol=1e-4)
+    with torch.no_grad():
+        together = stack(features, padding)
+        alone = stack(features[1:, :25], padding[1:, :25])
+    assert together.shape == (2, 60, 768) and torch.allclose(together[1, :25], alone[0], atol=1e-4)
 
 
-def test_model_reads_the_output_of_its_flare_layers(vocabulary, monkeypatch):
+def test_whole_flare_encoder_is_frozen_and_read_from_stored_features(vocabulary, monkeypatch):
+    # FLARE's whole encoder, here cut to one layer to keep the test light.
+    monkeypatch.setattr(training.model, 'FLARE_DEPTH', 1)
     torch.manual_seed(9)
     words = Vocabulary(vocabulary)
     features, frames, tokens, counts = tiny_batch(words)
-    wanted = torch.randn(2, 30, 768)
-    model = LipReader(words.size, flare_layers=1, **TINY)
-    loss, ctc, attention, teacher = model(features, frames, tokens, counts, teacher=wanted, teacher_weight=1.0)
+    stored = torch.randn(2, 30, 768)
+    model = LipReader(words.size, **TINY)
+    assert model.flare.whole and not model.flare.training and not any(module.training for module in model.flare.modules())
+    model.train()
+    assert not model.flare.training  # Never leaves evaluation mode: no dropout in a frozen encoder.
+    loss, _, _, teacher = model(features, frames, tokens, counts, teacher=stored, teacher_weight=1.0)
     loss.backward()
-    assert teacher > 0 and all(p.grad is None for p in model.flare.parameters())  # FLARE's layers are never trained.
-    assert model.teacher.weight.grad is not None
+    assert teacher == 0 and all(p.grad is None for p in model.flare.parameters())  # Nothing to copy, nothing trained.
     model.eval()
     with torch.no_grad():
-        states, _, _ = model.encode(features, frames)
-        changed, _, _ = model.encode(features + 1, frames)
-        assert not torch.allclose(states, changed)
-    # With every FLARE layer the encoder is FLARE's own: nothing to copy, and training hands in
-    # FLARE's stored output instead of running the layers.
-    monkeypatch.setattr(training.model, 'FLARE_DEPTH', 1)
-    model = LipReader(words.size, flare_layers=1, **TINY).eval()
-    assert model.whole_flare and model.teacher is None
-    with torch.no_grad():
-        loss, _, _, teacher = model(features, frames, tokens, counts, teacher=wanted, teacher_weight=1.0)
-        assert teacher == 0
-        states, _, _ = model.encode(features, frames, wanted)
-        again, _, _ = model.encode(torch.randn_like(features), frames, wanted)
-        assert torch.allclose(states, again)  # The stored FLARE output is all it reads.
+        states, _, _, _ = model.encode(features, frames, stored)
+        again, _, _, _ = model.encode(torch.randn_like(features), frames, stored)
+        assert torch.allclose(states, again)  # The stored FLARE output is all the text side reads...
+        computed, _, _, _ = model.encode(features, frames)
+        assert not torch.allclose(states, computed)  # ...and on video the layers run instead.
 
 
 def test_padding_does_not_change_a_clips_loss(vocabulary):

@@ -24,7 +24,7 @@ from training.text import Vocabulary
 def load(checkpoint_path: Path, device, frontend_path: Path | None = None) -> LipReader:
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config = checkpoint['config']
-    model = LipReader(config['vocab_size'], flare_layers=config['flare_layers'], dim=config['dim'], layers=config['layers'])
+    model = LipReader(config['vocab_size'], keep=config['keep'], dim=config['dim'], layers=config['layers'])
     model.load_state_dict(checkpoint['model'])
     if frontend_path:
         # A cheaper front end from train_frontend.py, in place of the one the checkpoint was trained behind.
