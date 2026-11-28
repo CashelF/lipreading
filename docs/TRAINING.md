@@ -28,32 +28,36 @@ A shard is a tar of `<clip>.mp4`, `<clip>.txt` and optionally `<clip>.ogg` (upst
 
 ## How it learns
 
-The small model is not trained from scratch. It is distilled from FLARE, the large model the app runs:
+The model is FLARE, the large model the app runs, with its 7B language model taken out and the rest cut down in steps. Every part starts from FLARE's own weights; nothing but the small text side is trained from scratch.
 
-- **Front end:** FLARE's own lip front end (a 3D patch stem and a small ConvNeXt, 14M parameters), with FLARE's trained weights, kept as they are.
-- **Encoder:** a 12-layer Conformer (width 256) that is trained to reproduce FLARE's encoder output for every frame, from the same video.
-- **Text:** a CTC head and a 6-layer attention decoder trained on the transcripts at the same time. 40M parameters in all, 26M of them trained; no language model.
-- **Size knob (`--flare-layers K`):** the model can also keep the first K of FLARE's own 18 encoder layers, between the front end and the Conformer, unchanged and never trained. Each is 17M parameters. The Conformer then has less of FLARE's encoder left to reproduce: all of it with K = 0, none with K = 18, where only the text side is trained. The first K layers are a working encoder as they are; six layers picked evenly from the 18 are not (0.2 cosine to FLARE's output before training), and training those layer by layer cost four times as much per step for the same early progress.
+- **Front end:** FLARE's lip front end (a 3D patch stem and a small ConvNeXt, 14M parameters). It is most of the compute, and [a cheaper version](#a-cheaper-front-end) of it works from smaller frames.
+- **Encoder:** FLARE's 18 encoder layers (314M parameters), or some of them.
+- **Text side:** a 12-layer Conformer (width 256), a CTC head and a 6-layer attention decoder: 26M parameters, in place of FLARE's language model.
+
+Training has two stages after the features are extracted:
+
+1. **The text side learns to read FLARE's whole encoder**, which stays frozen. Training reads the encoder's stored output, so no FLARE layer runs.
+2. **Encoder layers are dropped** (`--keep-layers` lists those that stay) and what is left, text side included, starts from stage 1 and is trained to give what the whole encoder gave while still reading text.
+
+**What did not work** (2026-11-27 and 28; logs in `data/train/archive/`): training on text alone, with or without audio targets (dev WER never under 100% in 2,800 video-hours); a small encoder trained from scratch to copy FLARE's output (40M model, best dev WER 74%); FLARE's first six layers frozen with a Conformer above them (146M, best 67%); six layers picked evenly from the 18 and trained from FLARE's weights; a per-layer target for each kept layer in stage 2 (no better than the final output alone). The two from-scratch encoder runs also collapsed after about 88,000 steps at a learning rate of 4e-4 or more: their losses jumped back to the untrained level.
 
 ## Results so far
 
-Measured 2026-11-27. Dev WER is on clips FLARE itself was trained on, greedy decoding from saved features. Held-out WER is on VoxCeleb2 speakers that no model here trained on, from raw video with beam 5.
+Measured 2026-11-28 unless noted. Dev WER is greedy decoding from saved features on the dev shards of both sources (FLARE trained on those clips). Held-out WER is on VoxCeleb2 speakers that nothing here trained on (`vox2-test-000000`), from raw video with beam 5.
 
-| Model | Parameters | Training so far | Dev WER | Held-out WER |
+| Model | Parameters | Training | Dev WER | Held-out WER |
 | --- | --- | --- | --- | --- |
-| FLARE with its 7B LLM, lip stream only | 342M + 7B | — | 10% (60 clips) | 31% (26–38%, 60 clips) |
-| `--flare-layers 18`: FLARE's encoder and the small text side, no LLM | 355M (26M trained) | 2,300 video-hours of AVYT only, about an hour | 18.5% | 35.5% (32–39%, 159 clips) |
-| The same with the [64×64 front end](#a-cheaper-front-end), 8-bit weights (354 MB) | 355M | front end: 400 more video-hours | 28.7% (323 clips) | 39.4% (36–43%, 159 clips) |
-| Six layers picked evenly from the 18, trained (dropped design) | 146M | 820 video-hours | 79% | not measured |
-| `--flare-layers 0` | 40M | 6,000 video-hours | 61%, flattening | not measured |
+| FLARE with its 7B LLM, lip stream only | 342M + 7B | — | not measured on this dev set | 31% (26–38%, 60 clips) |
+| Stage 1: FLARE's whole encoder + text side | 355M (354 MB at 8 bits) | 10,800 video-hours, 3 hours | 28.8% | 34.5% (31–39%, 159 clips) |
+| Stage 1 with the [64×64 front end](#a-cheaper-front-end) | 355M | front end: 400 more video-hours | not measured | 38.3% (34–43%, 159 clips) |
+| Stage 2, 12 layers kept (0 1 5 6 7 9 11 12 13 14 15 17) | 250M | 945 video-hours so far | 40.6% | not measured |
+| Stage 2, 9 layers kept (0 6 7 9 11 12 13 15 17) | 198M | 945 video-hours so far | 51.2% | not measured |
 
-- **The text side is not the limit.** A 26M-parameter text side on FLARE's encoder output is within a few points of FLARE with its LLM on held-out speakers, before it has seen any VoxCeleb2 training clips.
-- **The encoder is.** The smaller the share of FLARE's encoder a model keeps, the further it is from FLARE at the same amount of training: after 200 video-hours the CTC loss was 5.5 with no FLARE layers, 4.8 with the first 6, 4.1 with the first 12 and 2.0 with all 18. A Conformer twice as wide did no better than the 40M one. How close the smaller ones get with full-length training is the open question; those runs are in progress.
-- **Phone compute (estimated from parameter counts, not measured):** the front end is about 15 GFLOPs per second of video, each FLARE layer about 0.9, the Conformer about 1. So the 355M model is about 32 GFLOPs per second and the 40M one about 17: dropping layers saves download size more than compute, and a real-time phone model also needs a lighter front end.
-
-FLARE reads these clips well, so it is a good teacher. Lip stream only, on clips decoded exactly as training decodes them, it scored 10% WER on 60 clips from its own training data and 31% (95% interval 26–38%) on 60 clips of held-out VoxCeleb2 speakers (beam 5, measured 2026-11-27).
-
-**Why not from scratch.** Three attempts on 2026-11-27 trained on text alone, on text with a long short-clip stage, and on text plus audio targets (the raw spectrum, then codes from a Whisper teacher). After up to 2,800 video-hours none had a dev WER under 100%. FLARE's checkpoint shows its encoder took 800,000 pretraining steps to learn the same thing; a from-scratch run here would need weeks. With FLARE as the teacher the losses pass those runs' best within 300 video-hours. Logs are in `data/train/archive/`.
+- **The language model is not needed.** A 26M-parameter text side on FLARE's encoder is within a few points of FLARE with its LLM on held-out speakers, in a model about 20 times smaller.
+- **Dropping layers costs accuracy and saves little.** Skipping any one of layers 1–9 costs 1–3 dev WER points before retraining, but the losses add up: a third of the layers gone is about 12 points worse after 945 video-hours of stage 2, and still improving only slowly. Each layer is 17M parameters but little compute.
+- **Compute is in the front end.** Per second of video, through ONNX Runtime Web on this machine's CPU (WebAssembly, 4 threads): front end 201 ms at 88×88, 140 ms at 64×64, 92 ms at 48×48; one FLARE layer 6 ms; one text-side layer 1 ms. So the whole 355M model is about 320 ms per second of video there, two thirds of it front end. On the GPU the front end is 63% of the encoder side.
+- **Stored size is cheap to cut:** 8-bit weights change nothing (see the front-end section).
+- **Not measured yet: a phone.** `data/train/phone-bench/` holds a page that times these parts in a phone browser (WebGPU) and records the result.
 
 ## Extract features
 
@@ -64,7 +68,7 @@ FLARE runs once over every clip and saves what training reads:
   --shards "data/train/lips/avyt-talking-*.tar" "data/train/avyt/vox2/vox2-dev-*.tar"
 ```
 
-- **Output:** one folder per clip shard, plus `encoder.pt` (FLARE's encoder weights, which `--flare-layers` starts from). For every video frame it holds FLARE's lip front-end output (`front.npy`, the small model's input) and FLARE's encoder output (`teacher.npy`, its target), each 768 values standardized per frame and stored as int8. `index.json` lists each clip's key, transcript and frame count. `frontend.pt` holds the front-end weights, which every trained checkpoint keeps.
+- **Output:** one folder per clip shard, plus `encoder.pt` (FLARE's encoder weights, which every model starts from). For every video frame it holds FLARE's lip front-end output (`front.npy`, the small model's input) and FLARE's encoder output (`teacher.npy`, its target), each 768 values standardized per frame and stored as int8. `index.json` lists each clip's key, transcript and frame count. `frontend.pt` holds the front-end weights, which every trained checkpoint keeps.
 - **Cost:** 131 MB per video-hour (about 320 GB for the pilot). The AVYT shards ran at about 1,000 times real time on this GPU; the VoxCeleb2 shards were far slower while the machine was short of memory. Finished shards are skipped on a rerun.
 - **Memory:** about 40 GB with the default 8 workers. Start it with a cap (`systemd-run --property=MemoryMax=60G ...`). The first full run used 16 workers holding 4,000 clips each, peaked at 125 GB beside other jobs, and the machine's out-of-memory killer took other people's processes with it.
 - **Needs** the app's model setup (`scripts/setup_model.py`): `vendor/flare_runtime` and `models/FLARE-checkpoints`. Training itself needs neither, so it can run on a machine that has only the features.
@@ -74,18 +78,29 @@ FLARE runs once over every clip and saves what training reads:
 ## Train
 
 ```bash
-systemd-run --user --unit=lipreading-pilot-train --property=KillMode=mixed --property=TimeoutStopSec=180 \
-  --property=WorkingDirectory="$PWD" training/run_pilot.sh
-tail -f data/train/runs/pilot/train.jsonl
+systemd-run --user --unit=lipreading-pilot-train --property=MemoryMax=60G --property=MemorySwapMax=0 \
+  --property=KillMode=mixed --property=TimeoutStopSec=180 --property=WorkingDirectory="$PWD" training/run_pilot.sh
+tail -f data/train/runs/*/train.jsonl
 systemctl --user stop lipreading-pilot-train    # saves a checkpoint; start again to resume
 ```
 
-`training/run_pilot.sh` waits for the download and conversion units, builds a 1,000-piece SentencePiece vocabulary once, extracts any missing features, then runs `training/train.py` for 20 passes (about 48,000 video-hours).
+`training/run_pilot.sh` waits for the download and conversion units, builds a 1,000-piece SentencePiece vocabulary once, extracts any missing features, then runs the two stages of `training/train.py`:
 
-- **Speed:** about 4,000 video-hours per hour in 4 GiB of GPU memory, because no video is decoded and neither FLARE nor the front end runs. The same model trained from video managed about 500 with FLARE in the loop.
-- **Losses:** 0.1 CTC + 0.9 attention (with label smoothing), both per token, plus 5 × the teacher loss (`--teacher-weight`): mean absolute error plus one minus cosine similarity between the model's projected states and FLARE's features.
-- **Recipe:** AdamW, peak learning rate 5e-4, warm-up then cosine decay measured in hours of video seen, 9,600 frames per batch, bf16 autocast. The only augmentation is time masking of the input features: the model must fill the gap from context, while its target came from the whole clip.
-- **Padding:** the encoder zeroes padded frames before each convolution, so a clip is encoded the same alone or batched with longer clips.
+```bash
+# Stage 1: text side on FLARE's whole encoder (5 passes, about 3 hours).
+.venv-model/bin/python training/train.py --features data/train/features --train "avyt-talking-*" "vox2-dev-*" \
+  --dev avyt-talking-000000 vox2-dev-000000 --vocabulary data/train/vocabulary/unigram1000.model \
+  --output data/train/runs/flare-18 --hours 2400 --epochs 5 --frames-per-batch 9600 --lr 5e-4
+# Stage 2: keep 12 of the 18 layers and train what is left.
+.venv-model/bin/python training/train.py ... --output data/train/runs/keep-12 --init data/train/runs/flare-18/best.pt \
+  --keep-layers 0 1 5 6 7 9 11 12 13 14 15 17 --hours 2400 --epochs 1 --lr 1e-4
+```
+
+- **Always cap memory** (`--property=MemoryMax=24G --property=MemorySwapMax=0` on the unit) and check `free -g` first. The machine is shared, and a job without a cap takes other people's processes down with it when memory runs out.
+- **Speed:** stage 1 about 4,000 video-hours per hour in 5 GiB of GPU memory, because no video is decoded and no FLARE layer runs. Stage 2 runs the kept layers with gradients: about 1,100 video-hours per hour and 21 GiB with 12 layers.
+- **Losses:** 0.1 CTC + 0.9 attention (with label smoothing), both per token. In stage 2, plus 5 × the teacher loss (`--teacher-weight`): mean absolute error plus one minus cosine similarity between the kept layers' output and FLARE's stored encoder output, both standardized per frame.
+- **Recipe:** AdamW, warm-up then cosine decay measured in hours of video seen, 9,600 frames per batch, bf16 autocast. Peak learning rate 5e-4 for stage 1 and 1e-4 for stage 2; long runs at 4e-4 or more have collapsed. The only augmentation is time masking of the input features.
+- **Padding:** padded frames are zeroed before each convolution in both the FLARE layers and the Conformer, so a clip is encoded the same alone or batched with longer clips.
 - **Files in a run folder:** `train.jsonl` (numbers only), `last.pt` and `best.pt` (lowest dev WER). Dev WER is measured and `last.pt` written every 5,000 steps (about 470 video-hours) and at the end; the run resumes from `last.pt`. A checkpoint is the whole model, front end and FLARE layers included.
 - The first shard of each source is the dev set and is excluded from training. Their speakers can also appear in training video, so dev WER is for tracking progress, not a held-out result.
 

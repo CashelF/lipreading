@@ -1,12 +1,12 @@
 # Plan: a phone-sized lipreader
 
-Status: **pipeline working; approach changed 2026-11-27 from training from scratch to distilling FLARE.** FLARE's encoder with a small text side and no LLM reads held-out speakers at 35.5% WER against FLARE's 31% ([results](TRAINING.md#results-so-far)); the smaller versions are still training. Nothing here is in the live app.
+Status: **pipeline working for a 355M-parameter model; not yet phone-sized.** FLARE's encoder with a small text side and no LLM reads held-out speakers at 34.5% WER against FLARE's 31% ([results](TRAINING.md#results-so-far)). A small encoder trained from scratch failed; the model is now cut down from FLARE's own weights, and what a phone can run has not been measured. Nothing here is in the live app.
 
 Goal: run lipreading in a phone browser in real time, with word accuracy equal to FLARE-LLM Large or slightly worse, measured on held-out video (see Phases).
 
 ## Approach
 
-Distill FLARE's visual encoder into a small model ([TRAINING.md](TRAINING.md#how-it-learns)). Keep FLARE's 14M-parameter lip front end as it is, train a small Conformer to reproduce FLARE's encoder output frame by frame, and train a small text decoder on the transcripts at the same time. Don't scale FLARE up, and don't train from scratch.
+Take FLARE apart and cut it down ([TRAINING.md](TRAINING.md#how-it-learns)). Replace its 7B language model with a 26M text side trained on its encoder's output, then shrink the rest starting from FLARE's own weights: a front end that works from smaller frames, fewer encoder layers, 8-bit weights. Don't scale FLARE up, and don't train any part of the encoder from scratch.
 
 - **From scratch was tried first and did not start.** Three runs on 2026-11-27 (text only; a long short-clip stage; audio targets) never got dev WER under 100% in up to 2,800 video-hours. FLARE's own encoder took 800,000 pretraining steps to learn to tell mouth shapes apart.
 - **FLARE is a strong teacher on this data.** Lip stream only, it scored 31% WER on held-out VoxCeleb2 speakers and 10% on clips from its own training set (60 clips each, beam 5). The student sees the same video, so everything in the teacher's features is visible to it.
