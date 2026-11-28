@@ -43,6 +43,7 @@ Measured 2026-11-27. Dev WER is on clips FLARE itself was trained on, greedy dec
 | --- | --- | --- | --- | --- |
 | FLARE with its 7B LLM, lip stream only | 342M + 7B | — | 10% (60 clips) | 31% (26–38%, 60 clips) |
 | `--flare-layers 18`: FLARE's encoder and the small text side, no LLM | 355M (26M trained) | 2,300 video-hours of AVYT only, about an hour | 18.5% | 35.5% (32–39%, 159 clips) |
+| The same with the [64×64 front end](#a-cheaper-front-end), 8-bit weights (354 MB) | 355M | front end: 400 more video-hours | 28.7% (323 clips) | 39.4% (36–43%, 159 clips) |
 | Six layers picked evenly from the 18, trained (dropped design) | 146M | 820 video-hours | 79% | not measured |
 | `--flare-layers 0` | 40M | 6,000 video-hours | 61%, flattening | not measured |
 
@@ -100,7 +101,17 @@ The front end is most of the model's compute: on this GPU 1.7 ms per second of v
 
 It starts from FLARE's front-end weights and learns, from video resized to the given size, to reproduce the features `extract_features.py` saved at full resolution. `evaluate.py --frontend data/train/frontends/res64/frontend.pt` scores any trained checkpoint with it swapped in.
 
-First measurement (2026-11-27, 323 dev clips, greedy, whole-FLARE-encoder checkpoint, nothing else retrained): 24.5% WER with FLARE's front end at 88×88; 58% with the same weights at 64×64; 31% after 61 video-hours of this training at 64×64, with the front end 2.25 times cheaper.
+Measured 2026-11-27 with the whole-FLARE-encoder checkpoint trained on AVYT only, and nothing but the front end changed. The 64×64 front end was trained for 400 video-hours on AVYT clips (dev cosine to FLARE's features 0.965) and costs 2.25 times less.
+
+| Front end | Dev WER (323 clips, greedy) | Held-out WER (159 clips, beam 5) |
+| --- | --- | --- |
+| FLARE's, 88×88 | 24.5% | 35.5% (32–39%) |
+| Same weights at 64×64, untrained | 58.1% | not measured |
+| Distilled, 64×64 | 28.7% | 39.4% (36–43%) |
+
+The four points lost are before any adaptation: the front end never saw a VoxCeleb2 clip, and the layers behind it were not retrained on its features.
+
+**Stored size.** With that 64×64 front end, rounding every weight matrix to 8 bits per output channel leaves dev WER unchanged (28.7%) at 354 MB, against 1.4 GB in 32-bit floats. At 6 bits it is 30.9% at 266 MB; at 5 and 4 bits plain rounding breaks it (43% and 55%).
 
 ## Watch
 
