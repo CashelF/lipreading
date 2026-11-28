@@ -192,6 +192,7 @@ class FlareStack(nn.Module):
         self.mix_norm, self.mix_proj = nn.LayerNorm(3 * TEACHER_DIM), nn.Linear(3 * TEACHER_DIM, TEACHER_DIM)
         self.layers = nn.ModuleList(FlareLayer() for _ in range(count))
         self.requires_grad_(False)
+        self.train()  # A new module starts in training mode; this one never leaves evaluation mode.
 
     def load_flare(self, state: dict):
         """state: what extract_features.py saved as encoder.pt (all 18 layers)."""
@@ -201,7 +202,6 @@ class FlareStack(nn.Module):
     def train(self, mode: bool = True):
         return super().train(False)  # Frozen: never drop activations, whatever the model around it does.
 
-    @torch.no_grad()
     def forward(self, features, padding):
         lip = self.lip_proj(features)
         # FLARE joins three streams here: audio, face and lip. The first two are absent, as in its lip-only use.
@@ -261,7 +261,8 @@ class LipReader(nn.Module):
         features = features[:, :int(lengths.max())]
         padding = torch.arange(features.shape[1], device=features.device)[None] >= lengths[:, None]
         if self.flare is not None:
-            deep = self.flare(features, padding) if flare is None else flare[:, :features.shape[1]]
+            with torch.no_grad():
+                deep = self.flare(features, padding) if flare is None else flare[:, :features.shape[1]]
             features = F.layer_norm(deep.float(), (TEACHER_DIM,))  # Standardized per frame, as the stored features are.
         x = self.project(features).transpose(0, 1)  # (T, B, D)
         for layer in self.encoder.conformer_layers:
