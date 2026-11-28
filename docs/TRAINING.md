@@ -33,7 +33,22 @@ The small model is not trained from scratch. It is distilled from FLARE, the lar
 - **Front end:** FLARE's own lip front end (a 3D patch stem and a small ConvNeXt, 14M parameters), with FLARE's trained weights, kept as they are.
 - **Encoder:** a 12-layer Conformer (width 256) that is trained to reproduce FLARE's encoder output for every frame, from the same video.
 - **Text:** a CTC head and a 6-layer attention decoder trained on the transcripts at the same time. 40M parameters in all, 26M of them trained; no language model.
-- **Size knob (`--flare-layers`):** the model can also keep some of FLARE's own 18 encoder layers, between the front end and the Conformer, starting from FLARE's weights. Each adds 17M parameters. Six layers learned about three times faster than none in a first test (79% dev WER after 820 video-hours, against 2,200). All 18 is FLARE's whole encoder, left as it is, with only the text side trained: the accuracy ceiling for this design, at 355M parameters. On a phone the front end is most of the compute either way (about 15 of the model's GFLOPs per second of video), so extra layers cost download size more than speed.
+- **Size knob (`--flare-layers`):** the model can also keep some of FLARE's own 18 encoder layers, between the front end and the Conformer, starting from FLARE's weights. Each adds 17M parameters. With all 18 it is FLARE's whole encoder, left as it is, and only the text side is trained. With fewer, each kept layer learns from FLARE's layer at the same position (all 18 run beside the student in training, without gradients).
+
+## Results so far
+
+Measured 2026-11-27. Dev WER is on clips FLARE itself was trained on, greedy decoding from saved features. Held-out WER is on VoxCeleb2 speakers that no model here trained on, from raw video with beam 5.
+
+| Model | Parameters | Training so far | Dev WER | Held-out WER |
+| --- | --- | --- | --- | --- |
+| FLARE with its 7B LLM, lip stream only | 342M + 7B | — | 10% (60 clips) | 31% (26–38%, 60 clips) |
+| `--flare-layers 18`: FLARE's encoder and the small text side, no LLM | 355M (26M trained) | 2,300 video-hours of AVYT only, about an hour | 18.5% | 35.5% (32–39%, 159 clips) |
+| `--flare-layers 6` | 146M | 820 video-hours, final-output distillation | 79% | not measured |
+| `--flare-layers 0` | 40M | 6,000 video-hours | 61%, flattening | not measured |
+
+- **The text side is not the limit.** A 26M-parameter text side on FLARE's encoder output is within a few points of FLARE with its LLM on held-out speakers, before it has seen any VoxCeleb2 training clips.
+- **The encoder is.** The smaller the share of FLARE's encoder a model keeps, the further it is from FLARE at the same amount of training. A Conformer twice as wide did no better than the 40M one. How close six, nine or twelve layers get with layer-by-layer distillation and full-length training is the open question; those runs are in progress.
+- **Phone compute (estimated from parameter counts, not measured):** the front end is about 15 GFLOPs per second of video, each FLARE layer about 0.9, the Conformer about 1. So the 355M model is about 32 GFLOPs per second and the 40M one about 17: dropping layers saves download size more than compute, and a real-time phone model also needs a lighter front end.
 
 FLARE reads these clips well, so it is a good teacher. Lip stream only, on clips decoded exactly as training decodes them, it scored 10% WER on 60 clips from its own training data and 31% (95% interval 26–38%) on 60 clips of held-out VoxCeleb2 speakers (beam 5, measured 2026-11-27).
 

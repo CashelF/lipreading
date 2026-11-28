@@ -1,6 +1,6 @@
 # Plan: a phone-sized lipreader
 
-Status: **pilot training; approach changed 2026-11-27 from training from scratch to distilling FLARE.** Nothing here is in the live app.
+Status: **pipeline working; approach changed 2026-11-27 from training from scratch to distilling FLARE.** FLARE's encoder with a small text side and no LLM reads held-out speakers at 35.5% WER against FLARE's 31% ([results](TRAINING.md#results-so-far)); the smaller versions are still training. Nothing here is in the live app.
 
 Goal: run lipreading in a phone browser in real time, with word accuracy equal to FLARE-LLM Large or slightly worse, measured on held-out video (see Phases).
 
@@ -32,7 +32,7 @@ All throughput numbers below come from this machine: an RTX PRO 6000 Blackwell (
 
 See [Is this machine enough?](#is-this-machine-enough) for run lengths and rental cost.
 
-**Phone compute:** the 30M model needs 16.7 GFLOPs per second of video, and the 10M model needs 4.7. Both look affordable for a recent phone GPU over WebGPU, but that hasn't been measured on a phone. A WebGPU benchmark is the first phone step.
+**Phone compute (estimated from parameter counts):** FLARE's lip front end is about 15 GFLOPs per second of video, each of FLARE's encoder layers about 0.9, and the small Conformer about 1. The 355M model that keeps all 18 layers is about 32, the 40M one about 17. Whether a recent phone GPU sustains either over WebGPU hasn't been measured; a WebGPU benchmark is the first phone step, and a lighter front end is the largest saving available.
 
 ## Is this machine enough?
 
@@ -102,7 +102,8 @@ Train at 2.5k, 5k and 10k hours and plot the curve. Mine more data from YouTube-
 ## Phases
 
 1. **Baseline.** Score FLARE on public held-out video: WildVSR (5 hours of YouTube clips), the LRS3 test set, and speakers held out from Seamless Interaction. Webcam sentences recorded in the app ([EVALUATION.md](EVALUATION.md)) are an optional extra.
-2. **Pilot, about 2,400 hours, local (started 2026-11-27).** Distill FLARE into a 40M model on the AVYT and VoxCeleb2 mouth clips, which need no cropping or labelling ([TRAINING.md](TRAINING.md)). Score it against FLARE on held-out VoxCeleb2 speakers, where FLARE's lip-only WER is 31%.
-3. **Scale to 5k, then 10k hours.** Add Seamless Interaction, then MultiVSR. Build the crop pipeline for them; the crops must match what FLARE's lip stream expects. Then try what the pilot leaves out: unfreezing the front end for a final pass on video, and a face stream beside the lip stream.
-4. **Phone.** Use chunked streaming attention, int8 ONNX, WebGPU through ONNX Runtime Web, and MediaPipe in the browser. Measure real-time factor and battery on two phones.
-5. **Optional.** Use a small language model for rescoring.
+2. **Pilot, about 2,400 hours, local (started 2026-11-27).** Distill FLARE on the AVYT and VoxCeleb2 mouth clips, which need no cropping or labelling ([TRAINING.md](TRAINING.md)), at three sizes: all 18 of FLARE's encoder layers (355M parameters), six (146M) and none (40M). Score each against FLARE on held-out VoxCeleb2 speakers, where FLARE's lip-only WER is 31%.
+3. **Shrink it.** The 355M model is already close to FLARE; the phone needs it smaller and cheaper per frame. In order: find the fewest FLARE layers that stay within a few points (layer-by-layer distillation, longer training), then distill the front end, which is half the compute, into a lighter one with the same saved features as targets.
+4. **Scale to 5k, then 10k hours** if the curves are still improving with data. Add Seamless Interaction, then MultiVSR. Build the crop pipeline for them; the crops must match what FLARE's lip stream expects.
+5. **Phone.** Use chunked streaming attention, int8 ONNX, WebGPU through ONNX Runtime Web, and MediaPipe in the browser. Measure real-time factor and battery on two phones.
+6. **Optional.** Use a small language model for rescoring.
