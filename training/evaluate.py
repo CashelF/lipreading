@@ -21,11 +21,16 @@ from training.model import LipReader
 from training.text import Vocabulary
 
 
-def load(checkpoint_path: Path, device) -> LipReader:
+def load(checkpoint_path: Path, device, frontend_path: Path | None = None) -> LipReader:
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config = checkpoint['config']
     model = LipReader(config['vocab_size'], flare_layers=config['flare_layers'], dim=config['dim'], layers=config['layers'])
     model.load_state_dict(checkpoint['model'])
+    if frontend_path:
+        # A cheaper front end from train_frontend.py, in place of the one the checkpoint was trained behind.
+        cheaper = torch.load(frontend_path, map_location='cpu')
+        model.frontend.load_state_dict(cheaper['frontend'])
+        model.resolution = cheaper['resolution']
     return model.to(device).eval()
 
 
@@ -34,13 +39,14 @@ def main():
     parser.add_argument('--checkpoint', type=Path, required=True)
     parser.add_argument('--vocabulary', type=Path, required=True)
     parser.add_argument('--shards', type=Path, nargs='+', required=True)
+    parser.add_argument('--frontend', type=Path, help='Front end from train_frontend.py to evaluate with instead.')
     parser.add_argument('--beam', type=int, default=10)
     parser.add_argument('--limit', type=int, default=2000)
     parser.add_argument('--output', type=Path)
     args = parser.parse_args()
     device = torch.device('cuda')
     vocabulary = Vocabulary(args.vocabulary)
-    model = load(args.checkpoint, device)
+    model = load(args.checkpoint, device, args.frontend)
     dataset = ClipBatches(args.shards, args.vocabulary, frames_per_batch=6000, shuffle=False, with_text=True)
     rows = []
     for video, frames, _, _, texts in DataLoader(dataset, batch_size=None, num_workers=2):
@@ -52,7 +58,7 @@ def main():
             rows.append(score(text, vocabulary.decode(ids)))
         if len(rows) >= args.limit:
             break
-    report = {'checkpoint': args.checkpoint.name, 'beam': args.beam, 'clips': len(rows),
+    report = {'checkpoint': args.checkpoint.name, 'resolution': model.resolution, 'beam': args.beam, 'clips': len(rows),
               'reference_words': sum(row['reference_words'] for row in rows), 'wer': corpus_wer(rows),
               'wer_95_interval': bootstrap_interval(rows), 'captions_saved': False}
     print(json.dumps(report, indent=2))

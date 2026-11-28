@@ -11,6 +11,15 @@ from torchaudio.models import Conformer
 TEACHER_DIM = 768  # Width of FLARE's encoder output.
 
 
+def shrink(video, size: int):
+    """Normalized video (B, T, H, W) resized to ``size`` x ``size`` frames; unchanged when it already is."""
+    if video.shape[-1] == size:
+        return video
+    batch, frames = video.shape[:2]
+    small = F.interpolate(video.flatten(0, 1)[:, None], size=(size, size), mode='bilinear', antialias=True)
+    return small[:, 0].view(batch, frames, size, size)
+
+
 class ChannelNorm(nn.Module):
     """Layer normalization over the channel axis (axis 1) of an image or video tensor."""
 
@@ -221,9 +230,11 @@ class LipReader(nn.Module):
     """
 
     def __init__(self, vocab_size: int, *, flare_layers: int = 0, dim: int = 256, layers: int = 12, heads: int = 4,
-                 decoder_layers: int = 6, dropout: float = 0.1):
+                 decoder_layers: int = 6, dropout: float = 0.1, resolution: int = 88):
         super().__init__()
         self.vocab_size, self.dim = vocab_size, dim
+        # Frame size the front end runs at: FLARE's 88, or less for one that train_frontend.py taught to cope.
+        self.resolution = resolution
         self.sos_eos = vocab_size - 1
         self.frontend = Frontend().requires_grad_(False)
         self.flare = FlareStack(flare_layers) if flare_layers else None
@@ -241,7 +252,7 @@ class LipReader(nn.Module):
     @torch.no_grad()
     def front(self, video):
         """Normalized video (B, T, 88, 88) to features (B, T, 768), standardized per frame as they are on disk."""
-        return F.layer_norm(self.frontend(video).float(), (Frontend.dim,))
+        return F.layer_norm(self.frontend(shrink(video, self.resolution)).float(), (Frontend.dim,))
 
     def encode(self, features, lengths, flare=None):
         """features: (B, T, 768). Returns encoder states, their lengths and a padding mask. ``flare``
