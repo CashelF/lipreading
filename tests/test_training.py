@@ -193,6 +193,35 @@ def test_time_mask_hides_whole_frames_inside_each_clip():
     assert hidden[0].sum() <= 40 and hidden[1].sum() <= 10  # At most 10 frames per second of video.
 
 
+def test_clip_targets_pair_each_clip_with_its_own_stored_features(tmp_path, vocabulary):
+    from training.train_frontend import ClipTargets, distance
+    clips = [(60, SENTENCES[0]), (72, SENTENCES[1]), (66, SENTENCES[2])]
+    shard = write_shard(tmp_path / 'part.tar', clips)
+    # Features are stored in another order than the shard's, as extraction sorts clips by length.
+    folder = tmp_path / 'features' / 'part'
+    folder.mkdir(parents=True)
+    order = [2, 0, 1]
+    np.save(folder / 'front.npy', np.concatenate([np.full((clips[n][0], 768), n, np.int8) for n in order]))
+    (folder / 'index.json').write_text(json.dumps({'clips': [[f'clip{n:04d}', clips[n][1], clips[n][0]] for n in order]}))
+    seen = {}
+    for video, frames, _, _, wanted in ClipTargets([shard], tmp_path / 'features', vocabulary, frames_per_batch=80, shuffle=False):
+        assert video.shape[1:] == (int(frames.max()), 96, 96) and wanted.shape == (len(frames), int(frames.max()), 768)
+        for row, count in enumerate(frames.tolist()):
+            seen[count] = int(wanted[row, 0, 0])
+            assert (wanted[row, :count] == wanted[row, 0, 0]).all() and not wanted[row, count:].any()
+    assert seen == {60: 0, 72: 1, 66: 2}  # Each clip length came with the features stored under its own key.
+    same = torch.randn(2, 9, 768)
+    loss, cosine = distance(same * 3 + 1, torch.nn.functional.layer_norm(same, (768,)), torch.tensor([9, 4]))
+    assert float(loss) == pytest.approx(0, abs=1e-4) and float(cosine) == pytest.approx(1, abs=1e-4)
+
+
+def test_front_end_runs_on_smaller_frames():
+    video = torch.randn(1, 6, 88, 88)
+    assert training.model.shrink(video, 88) is video and training.model.shrink(video, 64).shape == (1, 6, 64, 64)
+    model = LipReader(50, resolution=64, **TINY).eval()
+    assert model.front(video).shape == (1, 6, 768)
+
+
 def test_front_end_matches_flare(tmp_path):
     """Our front end must compute what FLARE's does, or its trained weights and stored features mean nothing."""
     source = Path(__file__).resolve().parents[1] / 'vendor/FLARE/flare/convnext.py'

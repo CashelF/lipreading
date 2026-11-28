@@ -87,6 +87,21 @@ systemctl --user stop lipreading-pilot-train    # saves a checkpoint; start agai
 - **Files in a run folder:** `train.jsonl` (numbers only), `last.pt` and `best.pt` (lowest dev WER). Dev WER is measured and `last.pt` written every 5,000 steps (about 470 video-hours) and at the end; the run resumes from `last.pt`. A checkpoint is the whole model, front end and FLARE layers included.
 - The first shard of each source is the dev set and is excluded from training. Their speakers can also appear in training video, so dev WER is for tracking progress, not a held-out result.
 
+## A cheaper front end
+
+The front end is most of the model's compute: on this GPU 1.7 ms per second of video, against 0.8 ms for all 18 FLARE layers and 0.2 ms for the Conformer. Its cost falls with the square of the frame size, so `training/train_frontend.py` teaches it to work from smaller frames:
+
+```bash
+.venv-model/bin/python training/train_frontend.py --resolution 64 --hours 400 \
+  --clips "data/train/lips/avyt-talking-*.tar" --features data/train/features \
+  --dev data/train/lips/avyt-talking-000000.tar --vocabulary data/train/vocabulary/unigram1000.model \
+  --output data/train/frontends/res64
+```
+
+It starts from FLARE's front-end weights and learns, from video resized to the given size, to reproduce the features `extract_features.py` saved at full resolution. `evaluate.py --frontend data/train/frontends/res64/frontend.pt` scores any trained checkpoint with it swapped in.
+
+First measurement (2026-11-27, 323 dev clips, greedy, whole-FLARE-encoder checkpoint, nothing else retrained): 24.5% WER with FLARE's front end at 88×88; 58% with the same weights at 64×64; 31% after 61 video-hours of this training at 64×64, with the front end 2.25 times cheaper.
+
 ## Watch
 
 ```bash
