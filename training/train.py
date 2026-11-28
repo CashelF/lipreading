@@ -44,11 +44,12 @@ def save(path: Path, state: dict):
 def evaluate(model, loader, vocabulary, device, limit: int) -> dict:
     model.eval()
     rows, losses, clips = [], [], 0
-    for front, frames, tokens, token_counts, _, texts in loader:
+    for front, frames, tokens, token_counts, teacher, texts in loader:
         features, frames = restore(front.to(device)), frames.to(device)
+        wide = restore(teacher.to(device)) if model.whole_flare else None
         with torch.autocast('cuda', torch.bfloat16):
-            loss = model(features, frames, tokens.to(device), token_counts.to(device))[0]
-            predictions = model.greedy(features, frames)
+            loss = model(features, frames, tokens.to(device), token_counts.to(device), teacher=wide)[0]
+            predictions = model.greedy(features, frames, wide=wide)
         losses.append(float(loss))
         rows += [score(text, vocabulary.decode(ids)) for text, ids in zip(texts, predictions)]
         clips += len(texts)
@@ -76,8 +77,11 @@ def main():
     parser.add_argument('--teacher-weight', type=float, default=5.0,
                         help='Weight of the loss for reproducing FLARE\'s encoder features, against the text losses.')
     parser.add_argument('--workers', type=int, default=12)
+    parser.add_argument('--flare-layers', type=int, default=0,
+                        help='How many of FLARE\'s 18 encoder layers the model keeps (17M parameters each), starting '
+                             'from FLARE\'s weights. 18 keeps the whole encoder as it is.')
     parser.add_argument('--dim', type=int, default=256)
-    parser.add_argument('--layers', type=int, default=12)
+    parser.add_argument('--layers', type=int, default=12, help='Layers of the small Conformer on top.')
     parser.add_argument('--dev-clips', type=int, default=1500)
     parser.add_argument('--max-frames', type=int, default=400, help='Longest clip used, for training and dev.')
     parser.add_argument('--stop-after-steps', type=int, help='For smoke tests.')
@@ -86,9 +90,11 @@ def main():
     device = torch.device('cuda')
     args.output.mkdir(parents=True, exist_ok=True)
     vocabulary = Vocabulary(args.vocabulary)
-    model = LipReader(vocabulary.size, dim=args.dim, layers=args.layers).to(device)
+    model = LipReader(vocabulary.size, flare_layers=args.flare_layers, dim=args.dim, layers=args.layers).to(device)
     # The front end is FLARE's and stays as it is; training never runs it, but the checkpoint must hold it.
     model.frontend.load_state_dict(torch.load(args.features / 'frontend.pt', map_location=device))
+    if model.flare is not None:
+        model.flare.load_flare(torch.load(args.features / 'encoder.pt', map_location=device))
     trained = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW([{'params': [p for p in trained if p.ndim > 1], 'weight_decay': args.weight_decay},
                                    {'params': [p for p in trained if p.ndim <= 1], 'weight_decay': 0.0}],
@@ -122,7 +128,8 @@ def main():
 
     def checkpoint_state():
         return {'model': model.state_dict(), 'optimizer': optimizer.state_dict(), 'state': state,
-                'config': {'dim': args.dim, 'layers': args.layers, 'vocab_size': vocabulary.size}}
+                'config': {'flare_layers': args.flare_layers, 'dim': args.dim, 'layers': args.layers,
+                           'vocab_size': vocabulary.size}}
 
     stopping = False
 

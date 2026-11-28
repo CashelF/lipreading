@@ -94,8 +94,13 @@ def main():
     # The lip front end runs inside FLARE's forward pass; keep its output instead of computing it twice.
     flare.encoder.feature_extractor_video_lip.resnet.register_forward_hook(
         lambda module, inputs, output: captured.__setitem__('front', output.transpose(1, 2)))
-    torch.save({name: value.cpu() for name, value in flare.encoder.feature_extractor_video_lip.resnet.state_dict().items()},
-               args.output / 'frontend.pt')
+    # Weights a trained model keeps or starts from, so training never needs FLARE itself.
+    lip = flare.encoder.feature_extractor_video_lip
+    torch.save({name: value.cpu() for name, value in lip.resnet.state_dict().items()}, args.output / 'frontend.pt')
+    parts = {'lip_proj': lip.proj, 'mix_norm': flare.encoder.layer_norm, 'mix_proj': flare.encoder.post_extract_proj,
+             'layers': flare.encoder.encoder.layers}
+    torch.save({f'{part}.{name}': value.float().cpu() for part, module in parts.items()
+                for name, value in module.state_dict().items()}, args.output / 'encoder.pt')
     loader = DataLoader(ShardClips([str(shard) for shard in shards], args.frames_per_batch, args.max_frames),
                         batch_size=None, num_workers=args.workers, prefetch_factor=2, in_order=False)
     pending = {}

@@ -33,6 +33,7 @@ The small model is not trained from scratch. It is distilled from FLARE, the lar
 - **Front end:** FLARE's own lip front end (a 3D patch stem and a small ConvNeXt, 14M parameters), with FLARE's trained weights, kept as they are.
 - **Encoder:** a 12-layer Conformer (width 256) that is trained to reproduce FLARE's encoder output for every frame, from the same video.
 - **Text:** a CTC head and a 6-layer attention decoder trained on the transcripts at the same time. 40M parameters in all, 26M of them trained; no language model.
+- **Size knob (`--flare-layers`):** the model can also keep some of FLARE's own 18 encoder layers, between the front end and the Conformer, starting from FLARE's weights. Each adds 17M parameters. Six layers learned about three times faster than none in a first test (79% dev WER after 820 video-hours, against 2,200). All 18 is FLARE's whole encoder, left as it is, with only the text side trained: the accuracy ceiling for this design, at 355M parameters. On a phone the front end is most of the compute either way (about 15 of the model's GFLOPs per second of video), so extra layers cost download size more than speed.
 
 FLARE reads these clips well, so it is a good teacher. Lip stream only, on clips decoded exactly as training decodes them, it scored 10% WER on 60 clips from its own training data and 31% (95% interval 26–38%) on 60 clips of held-out VoxCeleb2 speakers (beam 5, measured 2026-11-27).
 
@@ -47,7 +48,7 @@ FLARE runs once over every clip and saves what training reads:
   --shards "data/train/lips/avyt-talking-*.tar" "data/train/avyt/vox2/vox2-dev-*.tar"
 ```
 
-- **Output:** one folder per clip shard. For every video frame it holds FLARE's lip front-end output (`front.npy`, the small model's input) and FLARE's encoder output (`teacher.npy`, its target), each 768 values standardized per frame and stored as int8. `index.json` lists each clip's key, transcript and frame count. `frontend.pt` holds the front-end weights, which every trained checkpoint keeps.
+- **Output:** one folder per clip shard, plus `encoder.pt` (FLARE's encoder weights, which `--flare-layers` starts from). For every video frame it holds FLARE's lip front-end output (`front.npy`, the small model's input) and FLARE's encoder output (`teacher.npy`, its target), each 768 values standardized per frame and stored as int8. `index.json` lists each clip's key, transcript and frame count. `frontend.pt` holds the front-end weights, which every trained checkpoint keeps.
 - **Cost:** about 1,000 times real time on this GPU (2.4 hours for the pilot's 2,400 hours of video) and 131 MB per video-hour (about 320 GB for the pilot). Finished shards are skipped on a rerun.
 - **Needs** the app's model setup (`scripts/setup_model.py`): `vendor/flare_runtime` and `models/FLARE-checkpoints`. Training itself needs neither, so it can run on a machine that has only the features.
 - **No padding.** A batch holds only clips of the same length. FLARE's encoder lets padded frames leak into real ones: a clip padded beside a longer one got features only 0.55–0.97 similar to those it gets alone, which is how the app runs it.

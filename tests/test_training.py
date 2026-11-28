@@ -16,7 +16,8 @@ pytest.importorskip('av')
 pytest.importorskip('sentencepiece')
 
 from training.data import SCALE, ClipBatches, FeatureBatches, prepare, quantize, restore, time_mask
-from training.model import Frontend, LipReader
+import training.model
+from training.model import FlareLayer, FlareStack, Frontend, LipReader
 from training.shards import ShardWriter, read_samples
 from training.text import Vocabulary, clean, train_vocabulary
 from training.train import learning_rate
@@ -268,7 +269,7 @@ def test_teacher_loss_counts_only_real_frames_and_is_zero_for_a_perfect_copy(voc
         changed = wanted.clone()
         changed[1, 20:] += 100  # Past the end of the second clip.
         assert float(model(features, frames, tokens, counts, teacher=changed)[3]) == pytest.approx(float(teacher), rel=1e-5)
-        states, _, _ = model.encode(features, frames)
+        states, _, _, _ = model.encode(features, frames)
         assert float(model(features, frames, tokens, counts, teacher=model.teacher(states))[3]) == pytest.approx(0, abs=1e-5)
 
 
@@ -277,10 +278,75 @@ def test_a_clip_is_encoded_the_same_alone_or_beside_a_longer_clip(vocabulary):
     model = LipReader(Vocabulary(vocabulary).size, dim=32, layers=3, heads=2, decoder_layers=1).eval()
     features, frames = torch.randn(2, 80, 768), torch.tensor([80, 30])
     with torch.no_grad():
-        together, _, padding = model.encode(features, frames)
-        alone, _, _ = model.encode(features[1:, :30], frames[1:])
+        together, _, padding, _ = model.encode(features, frames)
+        alone, _, _, _ = model.encode(features[1:, :30], frames[1:])
     assert padding[1, 30:].all() and not padding[1, :30].any()
     assert torch.allclose(together[1, :30], alone[0], atol=1e-5)
+
+
+def test_flare_layer_matches_flare():
+    """The ported layer must compute what FLARE's does, or FLARE's weights mean nothing in it."""
+    source = Path(__file__).resolve().parents[1] / 'vendor/flare_runtime/models/qwen_conformer.py'
+    if not source.exists():
+        pytest.skip('FLARE runtime not installed (scripts/setup_model.py).')
+    pytest.importorskip('einops')
+    pytest.importorskip('transformers')
+    import importlib.util
+    import types
+    spec = importlib.util.spec_from_file_location('flare_qwen_conformer', source)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    torch.manual_seed(7)
+    theirs = module.Qwen2DecoderLayer(types.SimpleNamespace(encoder_embed_dim=64, encoder_attention_heads=4, num_key_value_heads=2), 0).eval()
+    ours = FlareLayer(dim=64, heads=4, shared_heads=2).eval()
+    ours.load_state_dict(theirs.state_dict())
+    x, padding = torch.randn(3, 50, 64), torch.zeros(3, 50, dtype=torch.bool)
+    with torch.no_grad():
+        expected = theirs(x, attention_mask=padding[:, None, None], position_ids=torch.arange(50)[None])[0]
+        assert torch.allclose(ours(x, padding), expected, atol=1e-5)
+
+
+def test_flare_stack_keeps_evenly_spaced_layers_and_ignores_padding():
+    assert FlareStack(1).keep == [0] and FlareStack(3).keep == [0, 8, 17] and FlareStack(18).keep == list(range(18))
+    torch.manual_seed(8)
+    stack = FlareStack(2).eval()
+    whole = {f'layers.{index}.{name}': torch.full_like(value, float(index))
+             for index in range(18) for name, value in stack.layers[0].state_dict().items()}
+    whole.update({name: value for name, value in stack.state_dict().items() if not name.startswith('layers.')})
+    stack.load_flare(whole)
+    assert float(stack.layers[0].post_layernorm.weight[0]) == 0 and float(stack.layers[1].post_layernorm.weight[0]) == 17
+    stack = FlareStack(2).eval()
+    features, frames = torch.randn(2, 60, 768), torch.tensor([60, 25])
+    padding = torch.arange(60)[None] >= frames[:, None]
+    with torch.no_grad():
+        together = stack(features, padding)
+        alone = stack(features[1:, :25], padding[1:, :25])
+    assert torch.allclose(together[1, :25], alone[0], atol=1e-4)
+
+
+def test_model_with_flare_layers_copies_the_teacher_from_them(vocabulary, monkeypatch):
+    torch.manual_seed(9)
+    words = Vocabulary(vocabulary)
+    features, frames, tokens, counts = tiny_batch(words)
+    wanted = torch.randn(2, 30, 768)
+    model = LipReader(words.size, flare_layers=1, **TINY).eval()
+    with torch.no_grad():
+        loss, ctc, attention, teacher = model(features, frames, tokens, counts, teacher=wanted, teacher_weight=1.0)
+        _, _, _, wide = model.encode(features, frames)
+        assert wide.shape == (2, 30, 768) and teacher > 0 and torch.isfinite(loss)
+        assert float(model(features, frames, tokens, counts, teacher=model.teacher(wide))[3]) == pytest.approx(0, abs=1e-5)
+    assert any(p.requires_grad for p in model.flare.parameters())
+    # With every FLARE layer the encoder is FLARE's own: nothing to copy, nothing in it trained, and
+    # training hands in FLARE's stored output instead of running the layers.
+    monkeypatch.setattr(training.model, 'FLARE_DEPTH', 1)
+    model = LipReader(words.size, flare_layers=1, **TINY).eval()
+    assert model.whole_flare and not any(p.requires_grad for p in model.flare.parameters())
+    with torch.no_grad():
+        loss, _, _, teacher = model(features, frames, tokens, counts, teacher=wanted, teacher_weight=1.0)
+        assert teacher == 0
+        states, _, _, _ = model.encode(features, frames, wanted)
+        again, _, _, _ = model.encode(torch.randn_like(features), frames, wanted)
+        assert torch.allclose(states, again)  # The stored FLARE output is all it reads.
 
 
 def test_padding_does_not_change_a_clips_loss(vocabulary):
